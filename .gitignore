@@ -1,0 +1,4 @@
+node_modules/
+mydial.db
+mydial.db-*
+data/

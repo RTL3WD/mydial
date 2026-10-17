@@ -1,0 +1,64 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>MyDial</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      theme: {
+        extend: {
+          fontFamily: {
+            sans: ["IBM Plex Sans", "ui-sans-serif", "system-ui", "sans-serif"],
+            mono: ["IBM Plex Mono", "ui-monospace", "monospace"],
+          },
+          colors: {
+            ink: "#071018",
+            panel: "#0c1722",
+            line: "#1a3144",
+            mint: "#3dffb0",
+          },
+        },
+      },
+    };
+  </script>
+  <style>
+    body { background: #071018; color: #d7e6f2; }
+    .field {
+      width: 100%;
+      border-radius: 0.55rem;
+      border: 1px solid #1a3144;
+      background: #071018;
+      padding: 0.5rem 0.7rem;
+      color: #e8f4ff;
+      outline: none;
+    }
+    .field:focus { border-color: #3dffb0; box-shadow: 0 0 0 3px rgba(61, 255, 176, 0.12); }
+    .nav-on { background: #123246; color: #f4fffb; box-shadow: inset 0 -2px 0 #3dffb0; }
+    .chip-on { background: #12382c; color: #b9ffdf; border-color: #1f6b4e; }
+    #flow-canvas .react-flow { background: #071018; }
+  </style>
+  <link rel="stylesheet" href="https://unpkg.com/@xyflow/react@12.8.6/dist/style.css">
+  <script type="importmap">
+  {
+    "imports": {
+      "react": "https://esm.sh/react@18.3.1",
+      "react/jsx-runtime": "https://esm.sh/react@18.3.1/jsx-runtime",
+      "react-dom": "https://esm.sh/react-dom@18.3.1",
+      "react-dom/client": "https://esm.sh/react-dom@18.3.1/client",
+      "@xyflow/react": "https://esm.sh/@xyflow/react@12.8.6?external=react,react-dom"
+    }
+  }
+  </script>
+</head>
+<body class="min-h-screen font-sans antialiased">
+  <div id="app"></div>
+  <div id="toast" class="pointer-events-none fixed bottom-5 left-1/2 z-50 hidden -translate-x-1/2 rounded-full bg-mint px-4 py-2 text-sm font-semibold text-ink shadow-lg"></div>
+  <div id="modal" class="fixed inset-0 z-40 hidden items-center justify-center bg-black/70 px-4 py-8"></div>
+  <script src="/app.js"></script>
+</body>
+</html>

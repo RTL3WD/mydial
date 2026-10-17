@@ -1,0 +1,14 @@
+services:
+  mydial:
+    build: .
+    ports:
+      - "3000:3000"
+    environment:
+      PORT: "3000"
+      DATABASE_PATH: /data/mydial.db
+    volumes:
+      - mydial-data:/data
+    restart: unless-stopped
+
+volumes:
+  mydial-data:

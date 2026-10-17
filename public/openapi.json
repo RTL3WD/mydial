@@ -1,0 +1,345 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "MyDial API",
+    "version": "1.0.0",
+    "description": "Local power dialer, inbox, campaign flows, and webhooks. Google Voice remains the dial method."
+  },
+  "servers": [{ "url": "/" }],
+  "tags": [
+    { "name": "Leads" },
+    { "name": "Queue" },
+    { "name": "Campaigns" },
+    { "name": "Inbox" },
+    { "name": "Webhooks" },
+    { "name": "System" }
+  ],
+  "paths": {
+    "/api/health": {
+      "get": {
+        "tags": ["System"],
+        "summary": "Process and SQLite health",
+        "responses": { "200": { "description": "Health payload" } }
+      }
+    },
+    "/api/stats": {
+      "get": {
+        "tags": ["System"],
+        "summary": "Dashboard counts from real rows",
+        "responses": { "200": { "description": "Stats" } }
+      }
+    },
+    "/api/settings": {
+      "get": {
+        "tags": ["System"],
+        "summary": "Saved settings. Secrets are omitted.",
+        "responses": { "200": { "description": "Settings" } }
+      },
+      "patch": {
+        "tags": ["System"],
+        "summary": "Update voice or mailbox settings",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "gvLine": { "type": "string" },
+                  "clipboardFallback": { "type": "boolean" },
+                  "smtpHost": { "type": "string" },
+                  "smtpPort": { "type": "string" },
+                  "smtpUser": { "type": "string" },
+                  "smtpPass": { "type": "string" },
+                  "mailFromName": { "type": "string" },
+                  "mailFromEmail": { "type": "string" }
+                }
+              }
+            }
+          }
+        },
+        "responses": { "200": { "description": "Updated settings" } }
+      }
+    },
+    "/api/leads": {
+      "get": {
+        "tags": ["Leads"],
+        "summary": "List leads. Archived leads are hidden unless archived=1.",
+        "parameters": [
+          { "name": "search", "in": "query", "schema": { "type": "string" } },
+          { "name": "status", "in": "query", "schema": { "type": "string" } },
+          { "name": "campaignId", "in": "query", "schema": { "type": "string" } },
+          { "name": "archived", "in": "query", "schema": { "type": "string", "enum": ["1"] } }
+        ],
+        "responses": { "200": { "description": "Lead list" } }
+      },
+      "post": {
+        "tags": ["Leads"],
+        "summary": "Create a lead. A campaign flow enrolls them at Start.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/LeadInput" }
+            }
+          }
+        },
+        "responses": { "201": { "description": "Created lead" } }
+      }
+    },
+    "/api/leads/{id}": {
+      "get": {
+        "tags": ["Leads"],
+        "summary": "Lead, recent calls, and script",
+        "parameters": [{ "$ref": "#/components/parameters/LeadId" }],
+        "responses": { "200": { "description": "Lead" }, "404": { "description": "Missing" } }
+      },
+      "patch": {
+        "tags": ["Leads"],
+        "summary": "Update lead fields",
+        "parameters": [{ "$ref": "#/components/parameters/LeadId" }],
+        "requestBody": { "content": { "application/json": { "schema": { "$ref": "#/components/schemas/LeadInput" } } } },
+        "responses": { "200": { "description": "Updated lead" } }
+      },
+      "delete": {
+        "tags": ["Leads"],
+        "summary": "Delete a lead and its email threads",
+        "parameters": [{ "$ref": "#/components/parameters/LeadId" }],
+        "responses": { "200": { "description": "Deleted lead" } }
+      }
+    },
+    "/api/leads/{id}/archive": {
+      "post": {
+        "tags": ["Leads"],
+        "summary": "Archive or restore a lead. Archiving removes them from the queue.",
+        "parameters": [{ "$ref": "#/components/parameters/LeadId" }],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": { "archived": { "type": "boolean", "default": true } }
+              }
+            }
+          }
+        },
+        "responses": { "200": { "description": "Updated lead" } }
+      }
+    },
+    "/api/leads/{id}/reset-attempts": {
+      "post": {
+        "tags": ["Leads"],
+        "summary": "Set attempts back to 0. Status, notes, and call history stay.",
+        "parameters": [{ "$ref": "#/components/parameters/LeadId" }],
+        "responses": { "200": { "description": "Updated lead" } }
+      }
+    },
+    "/api/leads/{id}/dial": {
+      "post": {
+        "tags": ["Leads"],
+        "summary": "Record a dial attempt. Does not start the call timer.",
+        "parameters": [{ "$ref": "#/components/parameters/LeadId" }],
+        "responses": { "200": { "description": "Updated lead" } }
+      }
+    },
+    "/api/leads/{id}/disposition": {
+      "post": {
+        "tags": ["Leads"],
+        "summary": "Log an outcome. Duration comes from the manual timer. A saved flow routes the next step.",
+        "parameters": [{ "$ref": "#/components/parameters/LeadId" }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["outcome"],
+                "properties": {
+                  "outcome": { "type": "string", "enum": ["positive", "not_interested", "voicemail", "no_answer", "dnc"] },
+                  "notes": { "type": "string" },
+                  "durationSeconds": { "type": "integer" },
+                  "startedAt": { "type": "string", "format": "date-time" }
+                }
+              }
+            }
+          }
+        },
+        "responses": { "200": { "description": "Updated lead" } }
+      }
+    },
+    "/api/leads/{id}/requeue": {
+      "post": {
+        "tags": ["Leads"],
+        "summary": "Put a lead back in the queue. Blocked for DNC and archived leads.",
+        "parameters": [{ "$ref": "#/components/parameters/LeadId" }],
+        "responses": { "200": { "description": "Updated lead" } }
+      }
+    },
+    "/api/queue/next": {
+      "get": {
+        "tags": ["Queue"],
+        "summary": "Next due lead, the one after, and why others are waiting",
+        "parameters": [{ "name": "campaignId", "in": "query", "schema": { "type": "string" } }],
+        "responses": { "200": { "description": "Queue snapshot" } }
+      }
+    },
+    "/api/campaigns": {
+      "get": {
+        "tags": ["Campaigns"],
+        "summary": "Campaigns with cadence and flow",
+        "responses": { "200": { "description": "Campaign list" } }
+      },
+      "post": {
+        "tags": ["Campaigns"],
+        "summary": "Create a campaign with a starter flow",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["name"],
+                "properties": {
+                  "name": { "type": "string" },
+                  "description": { "type": "string" },
+                  "scriptId": { "type": "string", "nullable": true },
+                  "status": { "type": "string", "enum": ["active", "paused", "completed"] }
+                }
+              }
+            }
+          }
+        },
+        "responses": { "201": { "description": "Created campaign" } }
+      }
+    },
+    "/api/campaigns/{id}": {
+      "get": {
+        "tags": ["Campaigns"],
+        "parameters": [{ "$ref": "#/components/parameters/CampaignId" }],
+        "responses": { "200": { "description": "Campaign" } }
+      },
+      "patch": {
+        "tags": ["Campaigns"],
+        "summary": "Update name, status, script, cadence, or the flow graph",
+        "parameters": [{ "$ref": "#/components/parameters/CampaignId" }],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "name": { "type": "string" },
+                  "status": { "type": "string" },
+                  "scriptId": { "type": "string", "nullable": true },
+                  "cadence": { "type": "object" },
+                  "flow": { "$ref": "#/components/schemas/Flow" }
+                }
+              }
+            }
+          }
+        },
+        "responses": { "200": { "description": "Updated campaign" } }
+      },
+      "delete": {
+        "tags": ["Campaigns"],
+        "parameters": [{ "$ref": "#/components/parameters/CampaignId" }],
+        "responses": { "200": { "description": "Deleted campaign. Leads remain." } }
+      }
+    },
+    "/api/inbox": {
+      "get": {
+        "tags": ["Inbox"],
+        "summary": "Threads, idle suggestions, and mailbox summary",
+        "parameters": [
+          { "name": "folder", "in": "query", "schema": { "type": "string" } },
+          { "name": "search", "in": "query", "schema": { "type": "string" } }
+        ],
+        "responses": { "200": { "description": "Inbox" } }
+      }
+    },
+    "/api/webhooks": {
+      "get": {
+        "tags": ["Webhooks"],
+        "summary": "Webhook endpoints and recent deliveries",
+        "responses": { "200": { "description": "Webhooks" } }
+      },
+      "post": {
+        "tags": ["Webhooks"],
+        "summary": "Add an endpoint. An empty events list receives every event.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/WebhookInput" }
+            }
+          }
+        },
+        "responses": { "201": { "description": "Created webhook" } }
+      }
+    },
+    "/api/webhooks/{id}": {
+      "delete": {
+        "tags": ["Webhooks"],
+        "parameters": [{ "$ref": "#/components/parameters/WebhookId" }],
+        "responses": { "200": { "description": "Deleted" } }
+      }
+    },
+    "/api/webhooks/{id}/test": {
+      "post": {
+        "tags": ["Webhooks"],
+        "summary": "POST a webhook.test payload and record the result",
+        "parameters": [{ "$ref": "#/components/parameters/WebhookId" }],
+        "responses": { "200": { "description": "Delivery result" } }
+      }
+    }
+  },
+  "components": {
+    "parameters": {
+      "LeadId": { "name": "id", "in": "path", "required": true, "schema": { "type": "string" } },
+      "CampaignId": { "name": "id", "in": "path", "required": true, "schema": { "type": "string" } },
+      "WebhookId": { "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }
+    },
+    "schemas": {
+      "LeadInput": {
+        "type": "object",
+        "properties": {
+          "name": { "type": "string" },
+          "phone": { "type": "string" },
+          "company": { "type": "string" },
+          "email": { "type": "string" },
+          "title": { "type": "string" },
+          "notes": { "type": "string" },
+          "campaignId": { "type": "string", "nullable": true }
+        }
+      },
+      "Flow": {
+        "type": "object",
+        "properties": {
+          "nodes": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "id": { "type": "string" },
+                "type": { "type": "string", "enum": ["start", "dial", "email", "wait", "end"] },
+                "position": { "type": "object" },
+                "data": { "type": "object" }
+              }
+            }
+          },
+          "edges": { "type": "array", "items": { "type": "object" } }
+        }
+      },
+      "WebhookInput": {
+        "type": "object",
+        "required": ["url"],
+        "properties": {
+          "name": { "type": "string" },
+          "url": { "type": "string" },
+          "secret": { "type": "string" },
+          "events": { "type": "array", "items": { "type": "string" } },
+          "active": { "type": "boolean" }
+        }
+      }
+    }
+  }
+}

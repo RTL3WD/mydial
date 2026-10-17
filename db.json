@@ -1,0 +1,21 @@
+{
+  "leads": [
+    {
+      "id": "62e059ae-a195-4589-bd67-6c9220a80c8a",
+      "name": "Rob Lord",
+      "phone": "17029084316",
+      "company": "Automate St Pete",
+      "email": "automatestpete@gmail.com",
+      "notes": "",
+      "status": "new",
+      "stage": "New",
+      "attempts": 1,
+      "inQueue": true,
+      "queueOrder": 1,
+      "lastCalledAt": "2026-10-17T00:03:00.212Z",
+      "createdAt": "2026-10-17T00:02:56.407Z",
+      "updatedAt": "2026-10-17T00:03:00.212Z",
+      "history": []
+    }
+  ]
+}
