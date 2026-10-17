@@ -670,8 +670,9 @@ app.get("/api/health", (_req, res) => {
 
 const SECRET_SETTINGS = new Set(["smtpPass", "llmApiKey", "sttApiKey", "embedApiKey"]);
 const SETTING_DEFAULTS = {
-  llmProvider: "openai",
-  llmBaseUrl: "https://api.openai.com/v1",
+  llmProvider: "ollama",
+  llmBaseUrl: "http://127.0.0.1:11434/v1",
+  llmModel: "qwen3.8:27b-mlx",
   sttMode: "local",
   sttBaseUrl: "https://api.openai.com/v1",
   sttModel: "whisper-1",
