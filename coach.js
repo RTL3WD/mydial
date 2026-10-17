@@ -285,8 +285,8 @@ export function registerCoach(app, { db, nowIso, getLead, settingValue, putSetti
   }
 
   function modelProblem() {
-    const provider = setting("llmProvider") || "openai";
-    const model = setting("llmModel");
+    const provider = setting("llmProvider") || "ollama";
+    const model = setting("llmModel") || "qwen3.8:27b-mlx";
     const key = setting("llmApiKey");
     const base = setting("llmBaseUrl") || PROVIDER_BASES[provider] || "";
     if (!model) return "Choose a chat model on API & Docker. Listening and the transcript still stay here.";
@@ -298,8 +298,8 @@ export function registerCoach(app, { db, nowIso, getLead, settingValue, putSetti
   async function chatComplete(messages) {
     const problem = modelProblem();
     if (problem) throw new Error(problem);
-    const provider = setting("llmProvider") || "openai";
-    const model = setting("llmModel");
+    const provider = setting("llmProvider") || "ollama";
+    const model = setting("llmModel") || "qwen3.8:27b-mlx";
     const key = setting("llmApiKey");
     if (provider === "anthropic") {
       const system = messages.filter((message) => message.role === "system").map((message) => message.content).join("\n\n");
