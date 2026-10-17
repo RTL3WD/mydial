@@ -21,6 +21,7 @@ const NAV = [
   ["inbox", "Inbox"],
   ["campaigns", "Campaigns"],
   ["scripts", "Scripts"],
+  ["coach", "Coach"],
   ["analytics", "Analytics"],
   ["config", "API & Docker"],
 ];
@@ -77,11 +78,19 @@ const state = {
   inboxId: null,
   inboxDetail: null,
   composing: false,
+  coachSession: null,
+  coachPin: false,
+  coachStatus: "",
+  playbooks: [],
+  playbookId: null,
+  wrongFor: null,
 };
 
 let notesTimer = null;
 let toastTimer = null;
 let searchTimer = null;
+let captureHandle = null;
+let clipChain = Promise.resolve();
 
 function esc(value) {
   return String(value ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
@@ -257,6 +266,7 @@ async function loadQueue() {
     state.objectionLabel = null;
     state.dialStartedAt = null;
   }
+  await syncCoachToQueue();
 }
 
 async function loadLeads() {
@@ -306,9 +316,11 @@ function render() {
     flowRoot.unmount();
     flowRoot = null;
   }
-  const pages = { dial: renderDial, leads: renderLeads, inbox: renderInbox, campaigns: renderCampaigns, scripts: renderScripts, analytics: renderAnalytics, config: renderConfig };
+  const pages = { dial: renderDial, leads: renderLeads, inbox: renderInbox, campaigns: renderCampaigns, scripts: renderScripts, coach: renderCoachPage, analytics: renderAnalytics, config: renderConfig };
   document.getElementById("app").innerHTML = shell((pages[state.view] || renderDial)());
   paintTimer();
+  const coachLog = document.getElementById("coach-log");
+  if (coachLog) coachLog.scrollTop = coachLog.scrollHeight;
   if (state.view === "campaigns") {
     const token = flowToken;
     queueMicrotask(() => { void mountCampaignFlow(token); });
@@ -359,6 +371,10 @@ async function showView(view) {
     state.health = await api("/api/health");
     state.webhooks = await api("/api/webhooks");
   }
+  if (view === "coach") {
+    state.playbooks = await api("/api/playbooks");
+    if (!state.playbookId && state.playbooks[0]) state.playbookId = state.playbooks[0].id;
+  }
   if (view === "campaigns" && !state.builderId && state.campaigns[0]) state.builderId = state.campaigns[0].id;
   if (view === "scripts" && !state.scriptId && state.scripts[0]) state.scriptId = state.scripts[0].id;
   render();
@@ -388,9 +404,12 @@ function renderDial() {
     </section>
     <div class="mb-4 h-1.5 overflow-hidden rounded-full bg-panel"><div class="h-full bg-mint" style="width:${progress}%"></div></div>
     ${lead ? renderFocus(lead, campaign) : `
-      <section class="rounded-2xl border border-dashed border-line px-8 py-16 text-center">
-        <h2 class="text-2xl font-semibold text-white">Queue is clear</h2>
-        <p class="mt-2 text-sm text-slate-400">${ready === 0 && state.queue.waiting ? "Leads are waiting on the cadence window or a retry backoff." : "Add a lead or send a filtered list into the queue."}</p>
+      <section class="grid items-start gap-4 xl:grid-cols-[minmax(0,1fr)_400px]">
+        <section class="rounded-2xl border border-dashed border-line px-8 py-16 text-center">
+          <h2 class="text-2xl font-semibold text-white">Queue is clear</h2>
+          <p class="mt-2 text-sm text-slate-400">${ready === 0 && state.queue.waiting ? "Leads are waiting on the cadence window or a retry backoff." : "Add a lead or send a filtered list into the queue."}</p>
+        </section>
+        ${state.coachSession ? coachPanel(null) : ""}
       </section>
     `}
     <footer class="mt-4 flex flex-wrap gap-4 border-t border-line pt-3 text-xs text-slate-400">
@@ -402,14 +421,167 @@ function renderDial() {
   `;
 }
 
+function coachPrivacy(settings = state.settings) {
+  const leaves = [];
+  if (settings.sttMode === "remote") leaves.push("call audio is sent to the transcription URL");
+  const localChat = settings.llmProvider === "ollama" || /localhost|127\.0\.0\.1/.test(settings.llmBaseUrl || "");
+  if (settings.llmModel && !localChat) leaves.push("the transcript and your notes are sent to the chat model");
+  const localEmbed = !settings.embedProvider || settings.embedProvider === "none" || settings.embedProvider === "ollama" || /localhost|127\.0\.0\.1/.test(settings.embedBaseUrl || "");
+  if (!localEmbed) leaves.push("playbooks, reviews, and corrections are sent to the embedding model");
+  if (!leaves.length) return "Speech recognition stays in this browser. A local chat model keeps the transcript on this machine.";
+  return `Leaves this machine: ${leaves.join("; ")}.`;
+}
+
+function coachBubble(message) {
+  if (message.kind === "status") {
+    return `<p class="text-center text-[11px] text-slate-500">${esc(message.body)}</p>`;
+  }
+  const coach = message.kind === "coach" || message.kind === "review";
+  const mine = message.kind === "me" || message.kind === "note";
+  const tone = message.kind === "review"
+    ? "border-amber-800/80 bg-amber-950/30"
+    : message.kind === "coach"
+      ? "border-emerald-900 bg-emerald-950/40"
+      : message.kind === "note"
+        ? "border-line bg-ink/40"
+        : "border-line bg-ink/70";
+  const align = mine ? "ml-8" : "mr-8";
+  return `
+    <article class="rounded-xl border px-3 py-2 ${tone} ${align}">
+      <div class="flex items-center justify-between gap-2">
+        ${message.kind === "me" || message.kind === "prospect"
+          ? `<input data-speaker-for="${esc(message.id)}" class="w-28 bg-transparent text-[11px] uppercase tracking-wide text-slate-400 outline-none" value="${esc(message.speaker)}">`
+          : `<p class="text-[11px] uppercase tracking-wide text-slate-400">${esc(message.speaker)}${message.kind === "review" ? " · review" : ""}</p>`}
+        ${coach ? `<button type="button" data-action="coach-wrong" data-id="${esc(message.id)}" class="text-[11px] text-rose-300">Wrong</button>` : ""}
+      </div>
+      <p class="mt-1 whitespace-pre-wrap text-sm leading-6 text-slate-100">${esc(message.body)}</p>
+      ${message.hasAudio ? `<audio class="mt-2 h-8 w-full" controls src="/api/coach/audio/${esc(message.id)}"></audio>` : ""}
+      ${(message.corrections || []).map((item) => `<p class="mt-2 text-[11px] text-rose-200">Wrong because: ${esc(item.reason)}</p>`).join("")}
+      ${state.wrongFor === message.id ? `
+        <form data-wrong-form="${esc(message.id)}" class="mt-2 flex gap-2">
+          <input name="reason" class="field" placeholder="What should it have done?">
+          <button class="rounded-lg bg-mint px-2 text-xs font-semibold text-ink">Save</button>
+        </form>
+      ` : ""}
+    </article>
+  `;
+}
+
+function coachPanel(lead) {
+  const session = state.coachSession;
+  const otherLead = session && lead && session.leadId !== lead.id;
+  return `
+    <aside class="flex max-h-[calc(100vh-6.5rem)] flex-col rounded-2xl border border-line bg-panel xl:sticky xl:top-16">
+      <div class="border-b border-line px-4 py-3">
+        <div class="flex items-center justify-between gap-2">
+          <h3 class="text-sm font-semibold text-white">${esc(session?.leadName ? `Coach · ${session.leadName}` : "Coach")}</h3>
+          <div class="flex gap-2">
+            ${session ? `<button type="button" data-action="coach-pause" class="text-[11px] text-mint">${session.paused ? "Resume coach" : "Pause coach"}</button>` : ""}
+            ${captureHandle ? `<button type="button" data-action="coach-stop" class="text-[11px] text-slate-400">Stop listening</button>` : ""}
+            ${session ? `<button type="button" data-action="coach-hide" class="text-[11px] text-slate-500">Hide</button>` : ""}
+          </div>
+        </div>
+        <p id="coach-status" class="mt-1 text-[11px] text-slate-400">${esc(state.coachStatus || (session ? "Dial starts listening." : "Dial to start the coach."))}</p>
+        ${otherLead ? `<p class="mt-1 text-[11px] text-amber-200">Showing ${esc(session.leadName)} while ${esc(lead.name)} is up next.</p>` : ""}
+        <p class="mt-1 text-[11px] text-slate-500">${esc(coachPrivacy())}</p>
+      </div>
+      <div id="coach-log" class="min-h-0 flex-1 space-y-3 overflow-y-auto px-3 py-3">
+        ${session?.messages?.length ? session.messages.map(coachBubble).join("") : `<p class="text-sm text-slate-500">The thread fills in as you talk. After the prospect stops, the coach says what to say next. Typed messages here are to the coach.</p>`}
+        ${session?.reviewStatus === "pending" ? `<p class="text-center text-[11px] text-amber-200">Writing the review…</p>` : ""}
+      </div>
+      <form id="coach-form" class="flex gap-2 border-t border-line p-3">
+        <input id="coach-input" class="field" placeholder="${session ? "Tell the coach, or say “be more direct”" : "Dial first, then talk to the coach"}" ${session ? "" : "disabled"}>
+        <button class="rounded-lg bg-mint px-3 text-sm font-semibold text-ink" ${session ? "" : "disabled"}>Send</button>
+      </form>
+    </aside>
+  `;
+}
+
+function paintCoach() {
+  const aside = document.getElementById("coach-log");
+  if (!aside || state.view !== "dial") return;
+  const panel = aside.closest("aside");
+  if (!panel) return;
+  const draft = document.getElementById("coach-input")?.value || "";
+  const fresh = document.createElement("template");
+  fresh.innerHTML = coachPanel(state.queue.lead);
+  panel.replaceWith(fresh.content.firstElementChild);
+  const input = document.getElementById("coach-input");
+  if (input && draft) input.value = draft;
+  const log = document.getElementById("coach-log");
+  if (log) log.scrollTop = log.scrollHeight;
+}
+
+function renderCoachPage() {
+  const book = state.playbooks.find((item) => item.id === state.playbookId) || null;
+  return `
+    <div class="flex flex-wrap items-end justify-between gap-3">
+      <div>
+        <h1 class="text-lg font-semibold text-white">Coach</h1>
+        <p class="mt-1 text-xs text-slate-400">Persona and playbooks are retrieved on later calls. Corrections and reviews are remembered the same way.</p>
+      </div>
+    </div>
+    <div class="mt-4 grid gap-4 xl:grid-cols-2">
+      <form id="persona-form" class="rounded-2xl border border-line bg-panel p-4">
+        <h2 class="text-sm font-semibold text-white">Persona</h2>
+        <p class="mt-1 text-xs text-slate-400">You can also change this in the call thread, for example “be more direct”.</p>
+        <label class="mt-3 block text-xs text-slate-400">Name<input name="coachName" class="field mt-1" value="${esc(state.settings.coachName || "Coach")}"></label>
+        <label class="mt-3 block text-xs text-slate-400">Directness
+          <select name="coachDirectness" class="field mt-1">
+            ${["warm", "direct", "challenging"].map((level) => `<option value="${level}" ${state.settings.coachDirectness === level ? "selected" : ""}>${level}</option>`).join("")}
+          </select>
+        </label>
+        <label class="mt-3 block text-xs text-slate-400">What you sell<textarea name="coachProduct" rows="3" class="field mt-1">${esc(state.settings.coachProduct || "")}</textarea></label>
+        <label class="mt-3 block text-xs text-slate-400">Instructions<textarea name="coachInstructions" rows="5" class="field mt-1">${esc(state.settings.coachInstructions || "")}</textarea></label>
+        <button class="mt-3 rounded-lg bg-mint px-3 py-2 text-sm font-semibold text-ink">Save persona</button>
+      </form>
+      <form id="playbook-form" class="rounded-2xl border border-line bg-panel p-4">
+        <div class="flex items-center justify-between">
+          <h2 class="text-sm font-semibold text-white">Playbooks</h2>
+          <button type="button" data-action="new-playbook" class="text-xs text-mint">New</button>
+        </div>
+        <div class="mt-3 flex flex-wrap gap-2">
+          ${state.playbooks.map((item) => `<button type="button" data-action="select-playbook" data-id="${esc(item.id)}" class="rounded-full border px-2 py-1 text-[11px] ${item.id === book?.id ? "border-mint text-mint" : "border-line text-slate-300"}">${esc(item.name)}</button>`).join("") || `<p class="text-xs text-slate-500">No playbooks yet.</p>`}
+        </div>
+        <label class="mt-3 block text-xs text-slate-400">Name<input name="name" class="field mt-1" value="${esc(book?.name || "")}"></label>
+        <label class="mt-3 block text-xs text-slate-400">Text<textarea name="body" rows="10" class="field mt-1">${esc(book?.body || "")}</textarea></label>
+        <div class="mt-3 flex gap-2">
+          <button class="rounded-lg bg-mint px-3 py-2 text-sm font-semibold text-ink">Save playbook</button>
+          ${book ? `<button type="button" data-action="delete-playbook" data-id="${esc(book.id)}" class="rounded-lg border border-rose-900 px-3 py-2 text-sm text-rose-200">Delete</button>` : ""}
+        </div>
+      </form>
+    </div>
+  `;
+}
+
+async function syncCoachToQueue() {
+  if (state.coachPin) return;
+  if (state.coachSession?.reviewStatus === "pending") {
+    try {
+      state.coachSession = await api(`/api/coach/sessions/${state.coachSession.id}`);
+    } catch {
+      state.coachSession = null;
+    }
+    return;
+  }
+  const lead = state.queue.lead;
+  if (!lead) return;
+  if (state.coachSession && !state.coachSession.endedAt && state.coachSession.leadId === lead.id) return;
+  try {
+    const open = await api(`/api/coach/leads/${lead.id}/open`);
+    if (open.session) state.coachSession = open.session;
+  } catch {
+    /* the dialer still works without a thread */
+  }
+}
+
 function renderFocus(lead, campaign) {
   const url = voiceUrl(lead.phone);
   const script = lead.script;
   const sections = (script?.sections?.length ? script.sections : [{ label: "Opening", text: script?.body || "" }]).filter((section) => section.text);
-  const objection = script?.objections?.find((item) => item.label === state.objectionLabel);
   const follow = (campaign?.cadence?.steps || []).find((step) => step.type === "followup");
   return `
-    <section class="grid items-start gap-4 xl:grid-cols-[minmax(0,1fr)_340px]">
+    <section class="grid items-start gap-4 xl:grid-cols-[minmax(0,1fr)_400px]">
       <div class="space-y-4">
         <article class="rounded-2xl border border-line bg-panel p-5">
           <div class="flex flex-wrap items-start justify-between gap-4">
@@ -466,40 +638,45 @@ function renderFocus(lead, campaign) {
           <div class="mt-3 space-y-2">
             ${(lead.calls || []).length ? lead.calls.map((call) => `
               <div class="rounded-lg bg-ink/50 px-3 py-2 text-sm">
-                <span class="text-mint">${esc(STATUS_LABELS[call.outcome] || call.outcome)}</span>
-                <span class="text-slate-500"> · ${formatDuration(call.durationSeconds)} · ${esc(formatWhen(call.endedAt))}</span>
+                <div class="flex items-start justify-between gap-2">
+                  <div>
+                    <span class="text-mint">${esc(STATUS_LABELS[call.outcome] || call.outcome)}</span>
+                    <span class="text-slate-500"> · ${formatDuration(call.durationSeconds)} · ${esc(formatWhen(call.endedAt))}</span>
+                  </div>
+                  <button type="button" data-action="open-coach-call" data-id="${esc(call.id)}" class="text-[11px] text-mint">Thread</button>
+                </div>
                 ${call.notes ? `<p class="mt-1 text-slate-300">${esc(call.notes)}</p>` : ""}
               </div>
             `).join("") : `<p class="text-sm text-slate-500">No calls logged for this lead.</p>`}
           </div>
         </article>
-      </div>
-      <aside class="rounded-2xl border border-line bg-panel p-4">
-        <div class="flex items-center justify-between">
-          <h3 class="text-sm font-semibold text-white">Script</h3>
-          <span class="text-[11px] text-slate-500">${esc(script?.name || "No script")}</span>
-        </div>
-        ${sections.length ? sections.map((section) => `
-          <div class="mt-4">
-            <p class="text-[10px] uppercase tracking-wide text-emerald-300/80">${esc(section.label || "Section")}</p>
-            <p class="mt-1 whitespace-pre-wrap text-sm leading-6 text-slate-200">${esc(fillTokens(section.text, lead))}</p>
+        <article class="rounded-2xl border border-line bg-panel p-4">
+          <div class="flex items-center justify-between">
+            <h3 class="text-sm font-semibold text-white">Script</h3>
+            <span class="text-[11px] text-slate-500">${esc(script?.name || "No script")}</span>
           </div>
-        `).join("") : `<p class="mt-4 text-sm text-slate-400">Attach a script to this campaign to read it here. Use {{first_name}} and {{company}}.</p>`}
-        ${script?.objections?.length ? `
-          <div class="mt-5 border-t border-line pt-4">
-            <p class="text-[10px] uppercase tracking-wide text-slate-500">Objections</p>
-            <div class="mt-2 space-y-2">
-              ${script.objections.map((item) => `
-                <button type="button" data-action="objection" data-label="${esc(item.label)}" class="block w-full rounded-lg border border-line px-3 py-2 text-left text-sm hover:border-mint ${state.objectionLabel === item.label ? "border-mint bg-emerald-950/30" : ""}">
-                  <span class="text-slate-200">${esc(item.label)}</span>
-                  ${state.objectionLabel === item.label ? `<span class="mt-1 block text-xs leading-5 text-emerald-100">${esc(fillTokens(item.response, lead))}</span>` : ""}
-                </button>
-              `).join("")}
+          ${sections.length ? sections.map((section) => `
+            <div class="mt-4">
+              <p class="text-[10px] uppercase tracking-wide text-emerald-300/80">${esc(section.label || "Section")}</p>
+              <p class="mt-1 whitespace-pre-wrap text-sm leading-6 text-slate-200">${esc(fillTokens(section.text, lead))}</p>
             </div>
-          </div>
-        ` : ""}
-        ${objection ? "" : ""}
-      </aside>
+          `).join("") : `<p class="mt-4 text-sm text-slate-400">Attach a script to this campaign to read it here. Use {{first_name}} and {{company}}.</p>`}
+          ${script?.objections?.length ? `
+            <div class="mt-5 border-t border-line pt-4">
+              <p class="text-[10px] uppercase tracking-wide text-slate-500">Objections</p>
+              <div class="mt-2 space-y-2">
+                ${script.objections.map((item) => `
+                  <button type="button" data-action="objection" data-label="${esc(item.label)}" class="block w-full rounded-lg border border-line px-3 py-2 text-left text-sm hover:border-mint ${state.objectionLabel === item.label ? "border-mint bg-emerald-950/30" : ""}">
+                    <span class="text-slate-200">${esc(item.label)}</span>
+                    ${state.objectionLabel === item.label ? `<span class="mt-1 block text-xs leading-5 text-emerald-100">${esc(fillTokens(item.response, lead))}</span>` : ""}
+                  </button>
+                `).join("")}
+              </div>
+            </div>
+          ` : ""}
+        </article>
+      </div>
+      ${coachPanel(lead)}
     </section>
   `;
 }
@@ -598,8 +775,13 @@ function renderLeads() {
           <div class="mt-4 space-y-2">
             ${(detail.calls || []).slice(0, 4).map((call) => `
               <div class="rounded-lg bg-ink/50 px-3 py-2 text-sm">
-                <span class="text-mint">${esc(STATUS_LABELS[call.outcome] || call.outcome)}</span>
-                <span class="text-slate-500"> · ${formatDuration(call.durationSeconds)} · ${esc(formatWhen(call.endedAt))}</span>
+                <div class="flex items-start justify-between gap-2">
+                  <div>
+                    <span class="text-mint">${esc(STATUS_LABELS[call.outcome] || call.outcome)}</span>
+                    <span class="text-slate-500"> · ${formatDuration(call.durationSeconds)} · ${esc(formatWhen(call.endedAt))}</span>
+                  </div>
+                  <button type="button" data-action="open-coach-call" data-id="${esc(call.id)}" class="text-[11px] text-mint">Thread</button>
+                </div>
                 ${call.notes ? `<p class="mt-1 text-slate-300">${esc(call.notes)}</p>` : ""}
               </div>
             `).join("") || `<p class="text-xs text-slate-500">No calls logged.</p>`}
@@ -952,6 +1134,41 @@ function renderConfig() {
         <label class="mt-3 block text-xs text-slate-400">Line label<input id="gv-line" class="field mt-1" value="${esc(state.settings.gvLine || "")}" placeholder="+1 ..."></label>
         <label class="mt-3 flex items-center gap-2 text-xs"><input id="clipboard-fallback" type="checkbox" ${state.settings.clipboardFallback ? "checked" : ""}> Copy the number if the new tab is blocked</label>
         <button type="button" data-action="save-settings" class="mt-3 rounded-lg bg-mint px-3 py-2 text-sm font-semibold text-ink">Save</button>
+        <h3 class="mt-5 text-sm font-semibold">Models</h3>
+        <p class="mt-1 text-xs text-slate-400">${esc(coachPrivacy())}</p>
+        <div class="mt-3 grid gap-2">
+          <label class="text-xs text-slate-400">Chat provider
+            <select id="llm-provider" class="field mt-1">
+              ${["openai", "anthropic", "ollama", "compatible"].map((provider) => `<option value="${provider}" ${state.settings.llmProvider === provider ? "selected" : ""}>${provider}</option>`).join("")}
+            </select>
+          </label>
+          <label class="text-xs text-slate-400">Chat base URL<input id="llm-base" class="field mt-1" value="${esc(state.settings.llmBaseUrl || "")}" placeholder="https://api.openai.com/v1"></label>
+          <label class="text-xs text-slate-400">Chat model<input id="llm-model" class="field mt-1" value="${esc(state.settings.llmModel || "")}" placeholder="gpt-4o-mini or llama3.1"></label>
+          <label class="text-xs text-slate-400">Chat API key<input id="llm-key" type="password" class="field mt-1" placeholder="${state.settings.llmApiKeySet ? "Saved — leave blank to keep" : "sk-..."}"></label>
+          <label class="text-xs text-slate-400">Transcription
+            <select id="stt-mode" class="field mt-1">
+              <option value="local" ${state.settings.sttMode !== "remote" ? "selected" : ""}>In this browser (Whisper)</option>
+              <option value="remote" ${state.settings.sttMode === "remote" ? "selected" : ""}>OpenAI-compatible URL</option>
+            </select>
+          </label>
+          <label class="text-xs text-slate-400">Browser Whisper model
+            <select id="whisper-model" class="field mt-1">
+              ${["Xenova/whisper-tiny.en", "Xenova/whisper-base.en", "Xenova/whisper-small.en"].map((model) => `<option value="${model}" ${state.settings.whisperModel === model ? "selected" : ""}>${model.split("/")[1]}</option>`).join("")}
+            </select>
+          </label>
+          <label class="text-xs text-slate-400">Transcription URL<input id="stt-base" class="field mt-1" value="${esc(state.settings.sttBaseUrl || "")}"></label>
+          <label class="text-xs text-slate-400">Transcription model<input id="stt-model" class="field mt-1" value="${esc(state.settings.sttModel || "")}"></label>
+          <label class="text-xs text-slate-400">Transcription API key<input id="stt-key" type="password" class="field mt-1" placeholder="${state.settings.sttApiKeySet ? "Saved — leave blank to keep" : "Optional if the chat key is the same"}"></label>
+          <label class="text-xs text-slate-400">Embeddings
+            <select id="embed-provider" class="field mt-1">
+              ${["none", "openai", "ollama", "compatible"].map((provider) => `<option value="${provider}" ${(state.settings.embedProvider || "none") === provider ? "selected" : ""}>${provider === "none" ? "Full-text search only" : provider}</option>`).join("")}
+            </select>
+          </label>
+          <label class="text-xs text-slate-400">Embedding URL<input id="embed-base" class="field mt-1" value="${esc(state.settings.embedBaseUrl || "")}" placeholder="Blank uses the provider default"></label>
+          <label class="text-xs text-slate-400">Embedding model<input id="embed-model" class="field mt-1" value="${esc(state.settings.embedModel || "")}" placeholder="text-embedding-3-small"></label>
+          <label class="text-xs text-slate-400">Embedding API key<input id="embed-key" type="password" class="field mt-1" placeholder="${state.settings.embedApiKeySet ? "Saved — leave blank to keep" : "Optional if the chat key is the same"}"></label>
+        </div>
+        <button type="button" data-action="save-models" class="mt-3 rounded-lg bg-mint px-3 py-2 text-sm font-semibold text-ink">Save models</button>
         <label class="mt-4 block text-xs text-slate-400">Dial test<input id="dial-test" class="field mt-1" placeholder="(555) 010-0000"></label>
         <button type="button" data-action="dial-test" class="mt-2 rounded-lg border border-line px-3 py-2 text-xs">Open test link</button>
         <p id="dial-test-url" class="mt-2 break-all font-mono text-[11px] text-slate-500"></p>
@@ -1195,10 +1412,91 @@ function readScriptFromDom() {
   return { name: document.getElementById("script-name").value, sections, objections };
 }
 
+function requestCallMedia() {
+  if (!navigator.mediaDevices?.getUserMedia) {
+    return { mic: Promise.reject(new Error("This browser cannot use the microphone.")), tab: Promise.resolve(null) };
+  }
+  return {
+    mic: navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: false, noiseSuppression: false } }),
+    tab: navigator.mediaDevices.getDisplayMedia({ video: true, audio: true }).catch(() => null),
+  };
+}
+
+function enqueueClip(clip) {
+  clipChain = clipChain.then(() => sendClip(clip)).catch((error) => {
+    state.coachStatus = error.message;
+    paintCoach();
+  });
+}
+
+async function sendClip(clip) {
+  const started = Date.now();
+  while (!state.coachSession && Date.now() - started < 8000) {
+    await new Promise((resolve) => setTimeout(resolve, 40));
+  }
+  if (!state.coachSession || state.coachSession.endedAt) return;
+  const sessionId = state.coachSession.id;
+  const listen = await import("/listen.js");
+  let text = "";
+  if ((state.settings.sttMode || "local") !== "remote") {
+    text = await listen.transcribeLocal(clip.samples, clip.sampleRate, state.settings.whisperModel, (status) => {
+      state.coachStatus = status;
+      paintCoach();
+    });
+  }
+  const audio = listen.resample(clip.samples, clip.sampleRate, 16000);
+  const audioBase64 = listen.bytesToBase64(listen.encodeWav(audio, 16000));
+  const updated = await api(`/api/coach/sessions/${sessionId}/utterances`, {
+    method: "POST",
+    body: JSON.stringify({ speaker: clip.speaker, text, audioBase64 }),
+  });
+  if (state.coachSession?.id === sessionId) {
+    state.coachSession = updated;
+    state.coachStatus = updated.paused ? "Coach paused. The transcript is still listening." : (captureHandle?.mixed ? "Microphone only. Rename a line if that was you." : "Listening.");
+    paintCoach();
+  }
+}
+
+function beginCoach(lead) {
+  const media = captureHandle ? null : requestCallMedia();
+  state.coachPin = false;
+  state.coachStatus = "Starting the coach…";
+  const sessionPromise = api("/api/coach/sessions", { method: "POST", body: JSON.stringify({ leadId: lead.id }) });
+  return (async () => {
+    try {
+      const session = await sessionPromise;
+      state.coachSession = session;
+      if (media) {
+        const listen = await import("/listen.js");
+        captureHandle = await listen.attachMedia(media, {
+          onClip: enqueueClip,
+          onStatus: (status) => {
+            state.coachStatus = status;
+            paintCoach();
+          },
+        });
+        if (captureHandle.mixed) state.coachStatus = "Microphone only. Lines start as Prospect until you rename them.";
+      }
+      paintCoach();
+    } catch (error) {
+      state.coachStatus = error.message;
+      if (media?.mic) media.mic.then((stream) => stream.getTracks().forEach((track) => track.stop())).catch(() => {});
+      if (media?.tab) media.tab.then((stream) => stream?.getTracks?.().forEach((track) => track.stop())).catch(() => {});
+      paintCoach();
+    }
+  })();
+}
+
+function stopCallCapture() {
+  captureHandle?.stop?.();
+  captureHandle = null;
+}
+
 async function onDial(lead = state.queue.lead) {
   if (!lead || state.paused) return;
   startTimer(lead.id);
   paintTimer();
+  const listening = beginCoach(lead);
   if (state.settings.clipboardFallback) {
     navigator.clipboard?.writeText(e164(lead.phone)).catch(() => {});
   }
@@ -1213,6 +1511,7 @@ async function onDial(lead = state.queue.lead) {
     if (count && state.queue.lead?.id === lead.id) {
       count.textContent = `Attempts ${updated.attempts}${updated.lastCalledAt ? ` · last ${formatWhen(updated.lastCalledAt)}` : ""}`;
     }
+    await listening;
   } catch (error) {
     showToast(error.message);
   }
@@ -1251,6 +1550,9 @@ async function onDisposition(outcome) {
   state.busy = true;
   clearTimeout(notesTimer);
   const timed = consumeTimer(lead.id);
+  const sessionId = state.coachSession?.leadId === lead.id ? state.coachSession.id : null;
+  stopCallCapture();
+  const settle = clipChain;
   try {
     const updated = await api(`/api/leads/${lead.id}/disposition`, {
       method: "POST",
@@ -1259,6 +1561,15 @@ async function onDisposition(outcome) {
     state.session.talk += timed.durationSeconds;
     if (outcome === "positive" || outcome === "not_interested") state.session.connected += 1;
     showToast(updated.followupDraft ? `${STATUS_LABELS[outcome]} · follow-up draft filed` : STATUS_LABELS[outcome]);
+    if (sessionId) {
+      void settle.finally(() => api(`/api/coach/sessions/${sessionId}/finish`, { method: "POST" }).catch(() => {}));
+      try {
+        state.coachSession = await api(`/api/coach/sessions/${sessionId}`);
+        state.coachStatus = "Writing the review…";
+      } catch {
+        /* the review still lands on the call */
+      }
+    }
     await refreshCore();
     if (campaign?.cadence?.autoAdvance === false) {
       state.queue.lead = await api(`/api/leads/${lead.id}`);
@@ -1358,6 +1669,7 @@ document.body.addEventListener("click", async (event) => {
     render();
   } else if (action === "skip") {
     if (!state.queue.lead) return;
+    stopCallCapture();
     await api(`/api/leads/${state.queue.lead.id}/skip`, { method: "POST" });
     await loadQueue();
     render();
@@ -1636,6 +1948,71 @@ document.body.addEventListener("click", async (event) => {
     state.inboxDetail = created;
     await loadInbox();
     render();
+  } else if (action === "coach-pause") {
+    if (!state.coachSession) return;
+    state.coachSession = await api(`/api/coach/sessions/${state.coachSession.id}`, {
+      method: "PATCH",
+      body: JSON.stringify({ paused: !state.coachSession.paused }),
+    });
+    state.coachStatus = state.coachSession.paused ? "Coach paused. The transcript keeps going." : "Coach resumed.";
+    paintCoach();
+  } else if (action === "coach-stop") {
+    stopCallCapture();
+    state.coachStatus = "Listening stopped. The transcript is still here.";
+    paintCoach();
+  } else if (action === "coach-hide") {
+    state.coachPin = false;
+    state.coachSession = null;
+    state.wrongFor = null;
+    state.coachStatus = "";
+    render();
+  } else if (action === "coach-wrong") {
+    state.wrongFor = state.wrongFor === trigger.dataset.id ? null : trigger.dataset.id;
+    paintCoach();
+  } else if (action === "open-coach-call") {
+    try {
+      state.coachSession = await api(`/api/coach/calls/${trigger.dataset.id}`);
+      state.coachPin = true;
+      state.coachStatus = "Saved call. Replay the audio from each line.";
+      if (state.view !== "dial") await showView("dial");
+      else render();
+    } catch (error) {
+      showToast(error.message);
+    }
+  } else if (action === "save-models") {
+    const payload = {
+      llmProvider: document.getElementById("llm-provider").value,
+      llmBaseUrl: document.getElementById("llm-base").value,
+      llmModel: document.getElementById("llm-model").value,
+      sttMode: document.getElementById("stt-mode").value,
+      whisperModel: document.getElementById("whisper-model").value,
+      sttBaseUrl: document.getElementById("stt-base").value,
+      sttModel: document.getElementById("stt-model").value,
+      embedProvider: document.getElementById("embed-provider").value,
+      embedBaseUrl: document.getElementById("embed-base").value,
+      embedModel: document.getElementById("embed-model").value,
+    };
+    const llmKey = document.getElementById("llm-key").value;
+    const sttKey = document.getElementById("stt-key").value;
+    const embedKey = document.getElementById("embed-key").value;
+    if (llmKey) payload.llmApiKey = llmKey;
+    if (sttKey) payload.sttApiKey = sttKey;
+    if (embedKey) payload.embedApiKey = embedKey;
+    state.settings = await api("/api/settings", { method: "PATCH", body: JSON.stringify(payload) });
+    showToast("Models saved");
+    render();
+  } else if (action === "new-playbook") {
+    state.playbookId = null;
+    render();
+  } else if (action === "select-playbook") {
+    state.playbookId = trigger.dataset.id;
+    render();
+  } else if (action === "delete-playbook") {
+    await api(`/api/playbooks/${trigger.dataset.id}`, { method: "DELETE" });
+    state.playbooks = state.playbooks.filter((item) => item.id !== trigger.dataset.id);
+    state.playbookId = state.playbooks[0]?.id || null;
+    showToast("Playbook deleted");
+    render();
   } else if (action === "save-mailbox") {
     const form = document.getElementById("mail-settings");
     const payload = Object.fromEntries(new FormData(form));
@@ -1743,6 +2120,88 @@ document.body.addEventListener("input", (event) => {
   }
 });
 
+document.body.addEventListener("submit", async (event) => {
+  if (event.target.id === "coach-form") {
+    event.preventDefault();
+    const input = document.getElementById("coach-input");
+    const text = input?.value.trim();
+    if (!text || !state.coachSession) return;
+    input.value = "";
+    try {
+      const updated = await api(`/api/coach/sessions/${state.coachSession.id}/notes`, {
+        method: "POST",
+        body: JSON.stringify({ text }),
+      });
+      state.coachSession = updated;
+      if (updated.personaUpdated) {
+        state.settings = await api("/api/settings");
+        showToast("Coach instructions updated");
+      }
+      paintCoach();
+    } catch (error) {
+      showToast(error.message);
+    }
+    return;
+  }
+  if (event.target.dataset.wrongForm) {
+    event.preventDefault();
+    const reason = String(new FormData(event.target).get("reason") || "").trim();
+    if (!reason) return;
+    try {
+      state.coachSession = await api(`/api/coach/messages/${event.target.dataset.wrongForm}/wrong`, {
+        method: "POST",
+        body: JSON.stringify({ reason }),
+      });
+      state.wrongFor = null;
+      paintCoach();
+    } catch (error) {
+      showToast(error.message);
+    }
+    return;
+  }
+  if (event.target.id === "persona-form") {
+    event.preventDefault();
+    try {
+      state.settings = await api("/api/settings", {
+        method: "PATCH",
+        body: JSON.stringify(Object.fromEntries(new FormData(event.target))),
+      });
+      showToast("Persona saved");
+    } catch (error) {
+      showToast(error.message);
+    }
+    return;
+  }
+  if (event.target.id === "playbook-form") {
+    event.preventDefault();
+    const payload = Object.fromEntries(new FormData(event.target));
+    try {
+      const saved = state.playbookId
+        ? await api(`/api/playbooks/${state.playbookId}`, { method: "PATCH", body: JSON.stringify(payload) })
+        : await api("/api/playbooks", { method: "POST", body: JSON.stringify(payload) });
+      state.playbookId = saved.id;
+      state.playbooks = await api("/api/playbooks");
+      showToast("Playbook saved");
+      render();
+    } catch (error) {
+      showToast(error.message);
+    }
+  }
+});
+
+document.body.addEventListener("change", async (event) => {
+  if (!event.target.dataset.speakerFor) return;
+  try {
+    state.coachSession = await api(`/api/coach/messages/${event.target.dataset.speakerFor}`, {
+      method: "PATCH",
+      body: JSON.stringify({ speaker: event.target.value }),
+    });
+    paintCoach();
+  } catch (error) {
+    showToast(error.message);
+  }
+});
+
 document.getElementById("modal").addEventListener("click", (event) => {
   if (event.target.id === "modal") closeModal();
 });
@@ -1763,6 +2222,19 @@ document.addEventListener("keydown", (event) => {
 });
 
 setInterval(paintTimer, 1000);
+setInterval(async () => {
+  if (state.coachSession?.reviewStatus !== "pending") return;
+  try {
+    const latest = await api(`/api/coach/sessions/${state.coachSession.id}`);
+    const changed = latest.reviewStatus !== state.coachSession.reviewStatus || latest.messages.length !== state.coachSession.messages.length;
+    if (latest.reviewStatus === "done") state.coachStatus = "Review saved on this call.";
+    if (latest.reviewStatus === "failed") state.coachStatus = "The review did not finish.";
+    state.coachSession = latest;
+    if (changed && state.view === "dial") paintCoach();
+  } catch {
+    /* keep the last thread on screen */
+  }
+}, 2000);
 
 refreshCore().then(() => showView("dial")).catch((error) => {
   document.getElementById("app").innerHTML = `<p class="p-8 text-rose-300">${esc(error.message)}</p>`;

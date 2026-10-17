@@ -6,6 +6,7 @@ import swaggerUi from "swagger-ui-express";
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
+import { registerCoach } from "./coach.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PORT = process.env.PORT || 3000;
@@ -605,7 +606,7 @@ app.use("/api", (req, res, next) => {
   }
   next();
 });
-app.use(express.json({ limit: "2mb" }));
+app.use(express.json({ limit: "8mb" }));
 app.use(express.text({ type: ["text/csv", "text/plain"], limit: "2mb" }));
 app.use(express.static(path.join(__dirname, "public")));
 const openapi = JSON.parse(fs.readFileSync(path.join(__dirname, "public", "openapi.json"), "utf8"));
@@ -667,7 +668,19 @@ app.get("/api/health", (_req, res) => {
   });
 });
 
-const SECRET_SETTINGS = new Set(["smtpPass"]);
+const SECRET_SETTINGS = new Set(["smtpPass", "llmApiKey", "sttApiKey", "embedApiKey"]);
+const SETTING_DEFAULTS = {
+  llmProvider: "openai",
+  llmBaseUrl: "https://api.openai.com/v1",
+  sttMode: "local",
+  sttBaseUrl: "https://api.openai.com/v1",
+  sttModel: "whisper-1",
+  whisperModel: "Xenova/whisper-tiny.en",
+  embedProvider: "none",
+  coachName: "Coach",
+  coachDirectness: "direct",
+  coachInstructions: "Coach in the moment. Suggest the next sentence and why. Keep it short enough to read while talking.",
+};
 
 function readSettings() {
   const rows = db.prepare("SELECT key, value FROM meta WHERE key LIKE 'setting.%'").all();
@@ -677,7 +690,13 @@ function readSettings() {
     if (SECRET_SETTINGS.has(key)) continue;
     settings[key] = row.value === "true" ? true : row.value === "false" ? false : row.value;
   }
+  for (const [key, value] of Object.entries(SETTING_DEFAULTS)) {
+    if (settings[key] === undefined) settings[key] = value;
+  }
   settings.smtpConfigured = Boolean(settings.smtpHost);
+  for (const key of SECRET_SETTINGS) {
+    settings[`${key}Set`] = Boolean(db.prepare("SELECT value FROM meta WHERE key = ?").get(`setting.${key}`)?.value);
+  }
   return settings;
 }
 
@@ -687,10 +706,17 @@ app.get("/api/settings", (_req, res) => {
 
 app.patch("/api/settings", (req, res) => {
   const put = db.prepare("INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value");
-  for (const key of ["gvLine", "mailFromName", "mailFromEmail", "smtpHost", "smtpPort", "smtpUser"]) {
+  for (const key of [
+    "gvLine", "mailFromName", "mailFromEmail", "smtpHost", "smtpPort", "smtpUser",
+    "llmProvider", "llmBaseUrl", "llmModel", "sttMode", "sttBaseUrl", "sttModel", "whisperModel",
+    "embedProvider", "embedBaseUrl", "embedModel", "coachName", "coachDirectness", "coachProduct", "coachInstructions",
+  ]) {
     if (req.body?.[key] !== undefined) put.run(`setting.${key}`, String(req.body[key]).trim());
   }
   if (req.body?.smtpPass) put.run("setting.smtpPass", String(req.body.smtpPass));
+  for (const key of ["llmApiKey", "sttApiKey", "embedApiKey"]) {
+    if (req.body?.[key]) put.run(`setting.${key}`, String(req.body[key]));
+  }
   if (req.body?.clipboardFallback !== undefined) put.run("setting.clipboardFallback", req.body.clipboardFallback ? "true" : "false");
   res.json(readSettings());
 });
@@ -726,6 +752,10 @@ app.get("/api", (_req, res) => {
       "POST /api/leads/:id/reset-attempts",
       "GET /api/webhooks",
       "GET /api/docs",
+      "GET /api/playbooks",
+      "POST /api/coach/sessions",
+      "POST /api/coach/sessions/:id/utterances",
+      "POST /api/coach/messages/:id/wrong",
     ],
   });
 });
@@ -1065,6 +1095,7 @@ app.delete("/api/leads/:id", (req, res) => {
     return;
   }
   db.prepare("DELETE FROM email_threads WHERE lead_id = ?").run(lead.id);
+  deleteLeadCoach(lead.id);
   db.prepare("DELETE FROM leads WHERE id = ?").run(lead.id);
   res.json(lead);
 });
@@ -1115,6 +1146,7 @@ app.post("/api/leads/:id/disposition", (req, res) => {
     nextAttemptAt = new Date(Date.now() + Number(cadence.retryMinutes || 45) * 60000).toISOString();
   }
 
+  let callLogId = null;
   const save = transaction(() => {
     db.prepare(`
       UPDATE leads SET
@@ -1130,7 +1162,7 @@ app.post("/api/leads/:id/disposition", (req, res) => {
       endedAt,
       existing.id,
     );
-    insertCallLog({
+    callLogId = insertCallLog({
       lead: { ...existing, name: existing.name },
       outcome,
       notes,
@@ -1147,6 +1179,7 @@ app.post("/api/leads/:id/disposition", (req, res) => {
   const followupDraft = flow ? false : queueFollowupDraft(existing, outcome);
   const updated = getLead(existing.id);
   emitWebhook("lead.disposition", { ...leadSnapshot(updated), outcome, durationSeconds: duration });
+  reviewAfterDisposition({ leadId: existing.id, callLogId, outcome, notes });
   res.json({ ...updated, followupDraft });
 });
 
@@ -1420,6 +1453,14 @@ app.post("/api/call-logs", (req, res) => {
 function settingValue(key) {
   return db.prepare("SELECT value FROM meta WHERE key = ?").get(`setting.${key}`)?.value || "";
 }
+
+function putSetting(key, value) {
+  db.prepare("INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value")
+    .run(`setting.${key}`, String(value));
+}
+
+let reviewAfterDisposition = () => {};
+let deleteLeadCoach = () => {};
 
 function mailIdentity() {
   const address = settingValue("mailFromEmail");
@@ -2199,6 +2240,17 @@ app.post("/api/webhooks/:id/test", async (req, res) => {
   const result = await deliverHook(hook, "webhook.test", { ok: true, message: "MyDial test event" });
   res.json(result);
 });
+
+const coachApi = registerCoach(app, {
+  db,
+  nowIso,
+  getLead,
+  settingValue,
+  putSetting,
+  audioDir: path.join(path.dirname(DATABASE_PATH), "coach-audio"),
+});
+reviewAfterDisposition = coachApi.reviewAfterDisposition;
+deleteLeadCoach = coachApi.deleteLeadCoach;
 
 app.use((error, _req, res, _next) => {
   console.error(error);
