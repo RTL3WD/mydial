@@ -3,7 +3,7 @@
   "info": {
     "title": "MyDial API",
     "version": "1.0.0",
-    "description": "Local power dialer, inbox, campaign flows, and webhooks. Google Voice remains the dial method."
+    "description": "Local power dialer, inbox, campaign flows, webhooks, and a live sales coach. Google Voice remains the dial method."
   },
   "servers": [{ "url": "/" }],
   "tags": [
@@ -12,9 +12,23 @@
     { "name": "Campaigns" },
     { "name": "Inbox" },
     { "name": "Webhooks" },
-    { "name": "System" }
+    { "name": "System" },
+    { "name": "Coach" }
   ],
   "paths": {
+    "/api/playbooks": {
+      "get": { "tags": ["Coach"], "summary": "List coach playbooks", "responses": { "200": { "description": "Playbooks" } } },
+      "post": { "tags": ["Coach"], "summary": "Create a playbook", "responses": { "201": { "description": "Playbook" } } }
+    },
+    "/api/coach/sessions": {
+      "post": { "tags": ["Coach"], "summary": "Open or create the live coach thread for a lead", "responses": { "200": { "description": "Coach thread" } } }
+    },
+    "/api/coach/sessions/{id}/utterances": {
+      "post": { "tags": ["Coach"], "summary": "Add a spoken line and, after a prospect turn, a coach note", "responses": { "200": { "description": "Coach thread" } } }
+    },
+    "/api/coach/messages/{id}/wrong": {
+      "post": { "tags": ["Coach"], "summary": "Save why a coach note was wrong", "responses": { "200": { "description": "Coach thread" } } }
+    },
     "/api/health": {
       "get": {
         "tags": ["System"],
