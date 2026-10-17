@@ -289,7 +289,7 @@ function shell(body) {
           <div class="text-sm font-semibold tracking-wide text-white">MyDial</div>
           <div class="font-mono text-[10px] text-emerald-300/80">SQLite · local</div>
         </div>
-        <nav data-tour="nav" class="flex min-w-0 flex-1 gap-1 overflow-x-auto">
+        <nav class="flex min-w-0 flex-1 gap-1 overflow-x-auto">
           ${NAV.map(([id, label]) => `
             <button type="button" data-action="nav" data-view="${id}" class="shrink-0 whitespace-nowrap rounded-lg px-3 py-2 text-sm ${state.view === id ? "nav-on" : "text-slate-300 hover:bg-panel"}">
               ${label}
@@ -300,8 +300,7 @@ function shell(body) {
           `).join("")}
         </nav>
         <div class="hidden shrink-0 rounded-full border border-emerald-900/70 bg-emerald-950/40 px-3 py-1 text-xs text-emerald-200 sm:block">${esc(line)}</div>
-        <button type="button" data-action="walkthrough" class="shrink-0 rounded-lg border border-line px-3 py-2 text-sm text-slate-200 hover:bg-panel">Walkthrough</button>
-        <button type="button" data-action="open-lead" data-tour="quick-add" class="shrink-0 rounded-lg bg-mint px-3 py-2 text-sm font-semibold text-ink">+ Quick Add</button>
+        <button type="button" data-action="open-lead" class="shrink-0 rounded-lg bg-mint px-3 py-2 text-sm font-semibold text-ink">+ Quick Add</button>
       </div>
     </header>
     <main class="mx-auto max-w-[1440px] px-4 py-5">${body}</main>
@@ -389,7 +388,7 @@ function renderDial() {
   const progress = sessionTotal ? Math.round((state.session.dials / sessionTotal) * 100) : 0;
   const reasons = Object.entries(state.queue.reasons || {}).map(([reason, count]) => `${count} ${reason.toLowerCase()}`).join(" · ");
   return `
-    <section data-tour="dial-bar" class="mb-4 flex flex-wrap items-center justify-between gap-3">
+    <section class="mb-4 flex flex-wrap items-center justify-between gap-3">
       <div>
         <select id="dial-campaign" class="field w-auto max-w-xs text-sm font-semibold">
           <option value="">All queued leads</option>
@@ -406,11 +405,11 @@ function renderDial() {
     <div class="mb-4 h-1.5 overflow-hidden rounded-full bg-panel"><div class="h-full bg-mint" style="width:${progress}%"></div></div>
     ${lead ? renderFocus(lead, campaign) : `
       <section class="grid items-start gap-4 xl:grid-cols-[minmax(0,1fr)_400px]">
-        <section data-tour="dial-stage" class="rounded-2xl border border-dashed border-line px-8 py-16 text-center">
+        <section class="rounded-2xl border border-dashed border-line px-8 py-16 text-center">
           <h2 class="text-2xl font-semibold text-white">Queue is clear</h2>
           <p class="mt-2 text-sm text-slate-400">${ready === 0 && state.queue.waiting ? "Leads are waiting on the cadence window or a retry backoff." : "Add a lead or send a filtered list into the queue."}</p>
         </section>
-        ${coachPanel(null)}
+        ${state.coachSession ? coachPanel(null) : ""}
       </section>
     `}
     <footer class="mt-4 flex flex-wrap gap-4 border-t border-line pt-3 text-xs text-slate-400">
@@ -426,7 +425,8 @@ function coachPrivacy(settings = state.settings) {
   const leaves = [];
   if (settings.sttMode === "remote") leaves.push("call audio is sent to the transcription URL");
   const localChat = settings.llmProvider === "ollama" || /localhost|127\.0\.0\.1/.test(settings.llmBaseUrl || "");
-  if (settings.llmModel && !localChat) leaves.push("the transcript and your notes are sent to the chat model");
+  const chatModel = settings.llmLiveModel || settings.llmReviewModel || settings.llmModel;
+  if (chatModel && !localChat) leaves.push("the transcript and your notes are sent to the chat model");
   const localEmbed = !settings.embedProvider || settings.embedProvider === "none" || settings.embedProvider === "ollama" || /localhost|127\.0\.0\.1/.test(settings.embedBaseUrl || "");
   if (!localEmbed) leaves.push("playbooks, reviews, and corrections are sent to the embedding model");
   if (!leaves.length) return "Speech recognition stays in this browser. A local chat model keeps the transcript on this machine.";
@@ -472,7 +472,7 @@ function coachPanel(lead) {
   const session = state.coachSession;
   const otherLead = session && lead && session.leadId !== lead.id;
   return `
-    <aside data-tour="coach-live" class="flex max-h-[calc(100vh-6.5rem)] flex-col rounded-2xl border border-line bg-panel xl:sticky xl:top-16">
+    <aside class="flex max-h-[calc(100vh-6.5rem)] flex-col rounded-2xl border border-line bg-panel xl:sticky xl:top-16">
       <div class="border-b border-line px-4 py-3">
         <div class="flex items-center justify-between gap-2">
           <h3 class="text-sm font-semibold text-white">${esc(session?.leadName ? `Coach · ${session.leadName}` : "Coach")}</h3>
@@ -523,7 +523,7 @@ function renderCoachPage() {
       </div>
     </div>
     <div class="mt-4 grid gap-4 xl:grid-cols-2">
-      <form id="persona-form" data-tour="persona" class="rounded-2xl border border-line bg-panel p-4">
+      <form id="persona-form" class="rounded-2xl border border-line bg-panel p-4">
         <h2 class="text-sm font-semibold text-white">Persona</h2>
         <p class="mt-1 text-xs text-slate-400">You can also change this in the call thread, for example “be more direct”.</p>
         <label class="mt-3 block text-xs text-slate-400">Name<input name="coachName" class="field mt-1" value="${esc(state.settings.coachName || "Coach")}"></label>
@@ -536,7 +536,7 @@ function renderCoachPage() {
         <label class="mt-3 block text-xs text-slate-400">Instructions<textarea name="coachInstructions" rows="5" class="field mt-1">${esc(state.settings.coachInstructions || "")}</textarea></label>
         <button class="mt-3 rounded-lg bg-mint px-3 py-2 text-sm font-semibold text-ink">Save persona</button>
       </form>
-      <form id="playbook-form" data-tour="playbooks" class="rounded-2xl border border-line bg-panel p-4">
+      <form id="playbook-form" class="rounded-2xl border border-line bg-panel p-4">
         <div class="flex items-center justify-between">
           <h2 class="text-sm font-semibold text-white">Playbooks</h2>
           <button type="button" data-action="new-playbook" class="text-xs text-mint">New</button>
@@ -583,7 +583,7 @@ function renderFocus(lead, campaign) {
   const follow = (campaign?.cadence?.steps || []).find((step) => step.type === "followup");
   return `
     <section class="grid items-start gap-4 xl:grid-cols-[minmax(0,1fr)_400px]">
-      <div data-tour="dial-stage" class="space-y-4">
+      <div class="space-y-4">
         <article class="rounded-2xl border border-line bg-panel p-5">
           <div class="flex flex-wrap items-start justify-between gap-4">
             <div>
@@ -698,7 +698,7 @@ function statusCounts() {
 function renderLeads() {
   const detail = state.detail;
   return `
-    <section data-tour="leads" class="mb-4 flex flex-wrap items-center justify-between gap-3">
+    <section class="mb-4 flex flex-wrap items-center justify-between gap-3">
       <div>
         <h1 class="text-lg font-semibold text-white">Leads directory</h1>
         <p class="text-xs text-slate-400">${state.leads.length} showing · ${state.selected.size} selected</p>
@@ -722,7 +722,7 @@ function renderLeads() {
         <button type="button" data-action="status" data-status="${id}" class="rounded-full border px-3 py-1 text-xs ${state.statusFilter === id ? "chip-on" : "border-line text-slate-300"}">${label} (${count})</button>
       `).join("")}
     </div>
-    <div data-tour="leads-table" class="overflow-x-auto rounded-2xl border border-line">
+    <div class="overflow-x-auto rounded-2xl border border-line">
       <table class="min-w-full text-left text-sm">
         <thead class="bg-[#0a141e] text-[11px] uppercase tracking-wide text-slate-500">
           <tr>
@@ -796,10 +796,10 @@ function renderLeads() {
 function renderCampaigns() {
   const campaign = campaignById(state.builderId) || state.campaigns[0];
   if (!campaign) {
-    return `<section data-tour="campaigns" class="rounded-2xl border border-dashed border-line px-8 py-16 text-center"><h1 class="text-2xl font-semibold text-white">No campaigns</h1><p class="mt-2 text-sm text-slate-400">Build a flow of dial reminders, waits, and emails. Connect each dial outcome to the next step.</p><button type="button" data-action="open-campaign" class="mt-4 rounded-lg bg-mint px-4 py-2 text-sm font-semibold text-ink">New campaign</button></section>`;
+    return `<section class="rounded-2xl border border-dashed border-line px-8 py-16 text-center"><h1 class="text-2xl font-semibold text-white">No campaigns</h1><p class="mt-2 text-sm text-slate-400">Build a flow of dial reminders, waits, and emails. Connect each dial outcome to the next step.</p><button type="button" data-action="open-campaign" class="mt-4 rounded-lg bg-mint px-4 py-2 text-sm font-semibold text-ink">New campaign</button></section>`;
   }
   return `
-    <section data-tour="campaigns" class="mb-4 flex flex-wrap items-end justify-between gap-3">
+    <section class="mb-4 flex flex-wrap items-end justify-between gap-3">
       <div>
         <h1 class="text-lg font-semibold text-white">${esc(campaign.name)}</h1>
         <p class="text-xs text-slate-400">${campaign.leadCount} enrolled · ${campaign.queuedCount} in the dialer · ${percent(campaign.conversionRate)} connected</p>
@@ -826,7 +826,7 @@ function renderCampaigns() {
 function renderScripts() {
   const script = state.scripts.find((item) => item.id === state.scriptId) || state.scripts[0];
   return `
-    <section data-tour="scripts" class="mb-4 flex items-center justify-between">
+    <section class="mb-4 flex items-center justify-between">
       <div>
         <h1 class="text-lg font-semibold text-white">Scripts & objections</h1>
         <p class="text-xs text-slate-400">Tokens: {{first_name}} and {{company}} fill in on the dialer.</p>
@@ -890,7 +890,7 @@ function renderAnalytics() {
   ];
   return `
     <h1 class="text-lg font-semibold text-white">Analytics & history</h1>
-    <section data-tour="analytics" class="mt-4 grid gap-3 sm:grid-cols-3 xl:grid-cols-6">
+    <section class="mt-4 grid gap-3 sm:grid-cols-3 xl:grid-cols-6">
       ${cards.map(([label, value]) => `<article class="rounded-xl border border-line bg-panel px-3 py-3"><p class="text-[11px] uppercase text-slate-500">${label}</p><p class="mt-2 text-2xl font-semibold text-white">${esc(value)}</p></article>`).join("")}
     </section>
     <section class="mt-4 overflow-x-auto rounded-2xl border border-line">
@@ -953,7 +953,7 @@ function renderInbox() {
   const thread = detail?.thread;
   const lead = detail?.lead;
   return `
-    <section data-tour="inbox" class="mb-4 flex flex-wrap items-end justify-between gap-3">
+    <section class="mb-4 flex flex-wrap items-end justify-between gap-3">
       <div>
         <h1 class="text-lg font-semibold text-white">Email outreach &amp; inbox</h1>
         <p class="mt-1 text-xs text-slate-400">${summary.smtpConfigured ? `SMTP ready · ${esc(summary.fromEmail || "from address missing")}` : "Local outbox · add SMTP on the left when you want messages delivered"}</p>
@@ -967,7 +967,7 @@ function renderInbox() {
       </div>
     </section>
     <div class="grid items-start gap-3 xl:grid-cols-[220px_320px_minmax(0,1fr)]">
-      <aside data-tour="inbox-folders" class="rounded-2xl border border-line bg-panel p-3">
+      <aside class="rounded-2xl border border-line bg-panel p-3">
         <p class="px-2 text-[10px] uppercase tracking-wide text-slate-500">Mailboxes</p>
         <div class="mt-2 space-y-1">
           ${MAIL_FOLDERS.map(([id, label]) => `
@@ -1130,14 +1130,11 @@ function renderConfig() {
           <div>Volume <span class="text-slate-200">/data/mydial.db</span></div>
           <div>Restart <span class="text-slate-200">unless-stopped</span></div>
         </dl>
-        <div data-tour="voice">
         <h3 class="mt-4 text-sm font-semibold">Voice link</h3>
         <p class="mt-1 break-all font-mono text-[11px] text-slate-400">${esc(health?.googleVoicePrefix || "")}</p>
         <label class="mt-3 block text-xs text-slate-400">Line label<input id="gv-line" class="field mt-1" value="${esc(state.settings.gvLine || "")}" placeholder="+1 ..."></label>
         <label class="mt-3 flex items-center gap-2 text-xs"><input id="clipboard-fallback" type="checkbox" ${state.settings.clipboardFallback ? "checked" : ""}> Copy the number if the new tab is blocked</label>
         <button type="button" data-action="save-settings" class="mt-3 rounded-lg bg-mint px-3 py-2 text-sm font-semibold text-ink">Save</button>
-        </div>
-        <div data-tour="models">
         <h3 class="mt-5 text-sm font-semibold">Models</h3>
         <p class="mt-1 text-xs text-slate-400">${esc(coachPrivacy())}</p>
         <div class="mt-3 grid gap-2">
@@ -1147,7 +1144,8 @@ function renderConfig() {
             </select>
           </label>
           <label class="text-xs text-slate-400">Chat base URL<input id="llm-base" class="field mt-1" value="${esc(state.settings.llmBaseUrl || "")}" placeholder="http://127.0.0.1:11434/v1"></label>
-          <label class="text-xs text-slate-400">Chat model<input id="llm-model" class="field mt-1" value="${esc(state.settings.llmModel || "")}" placeholder="qwen3.8:27b-mlx"></label>
+          <label class="text-xs text-slate-400">Model during the call<input id="llm-live-model" class="field mt-1" value="${esc(state.settings.llmLiveModel || "")}" placeholder="qwen3.5:4b-mlx"></label>
+          <label class="text-xs text-slate-400">Model after the call<input id="llm-review-model" class="field mt-1" value="${esc(state.settings.llmReviewModel || "")}" placeholder="qwen3.5:9b-mlx"></label>
           <label class="text-xs text-slate-400">Chat API key<input id="llm-key" type="password" class="field mt-1" placeholder="${state.settings.llmApiKeySet ? "Saved — leave blank to keep" : "sk-..."}"></label>
           <label class="text-xs text-slate-400">Transcription
             <select id="stt-mode" class="field mt-1">
@@ -1173,7 +1171,6 @@ function renderConfig() {
           <label class="text-xs text-slate-400">Embedding API key<input id="embed-key" type="password" class="field mt-1" placeholder="${state.settings.embedApiKeySet ? "Saved — leave blank to keep" : "Optional if the chat key is the same"}"></label>
         </div>
         <button type="button" data-action="save-models" class="mt-3 rounded-lg bg-mint px-3 py-2 text-sm font-semibold text-ink">Save models</button>
-        </div>
         <label class="mt-4 block text-xs text-slate-400">Dial test<input id="dial-test" class="field mt-1" placeholder="(555) 010-0000"></label>
         <button type="button" data-action="dial-test" class="mt-2 rounded-lg border border-line px-3 py-2 text-xs">Open test link</button>
         <p id="dial-test-url" class="mt-2 break-all font-mono text-[11px] text-slate-500"></p>
@@ -1190,7 +1187,7 @@ function renderConfig() {
       </article>
     </div>
     <div class="mt-4">
-      <article data-tour="webhooks" class="rounded-2xl border border-line bg-panel p-4">
+      <article class="rounded-2xl border border-line bg-panel p-4">
         <h2 class="text-sm font-semibold">Webhooks</h2>
         <p class="mt-1 text-xs text-slate-400">MyDial POSTs <span class="font-mono">{ event, sentAt, data }</span> when something happens. A secret adds an HMAC SHA-256 header named X-MyDial-Signature.</p>
         <div class="mt-3 grid gap-2">
@@ -1653,8 +1650,6 @@ document.body.addEventListener("click", async (event) => {
     return;
   }
   if (action === "nav") await showView(trigger.dataset.view);
-  else if (action === "walkthrough") openWalkthrough();
-  else if (action === "start-tour") void startTour(trigger.dataset.tour);
   else if (action === "open-lead") leadForm(null);
   else if (action === "edit-lead") leadForm(state.detail?.id === trigger.dataset.id ? state.detail : state.leads.find((lead) => lead.id === trigger.dataset.id));
   else if (action === "open-campaign") campaignForm();
@@ -1990,7 +1985,8 @@ document.body.addEventListener("click", async (event) => {
     const payload = {
       llmProvider: document.getElementById("llm-provider").value,
       llmBaseUrl: document.getElementById("llm-base").value,
-      llmModel: document.getElementById("llm-model").value,
+      llmLiveModel: document.getElementById("llm-live-model").value,
+      llmReviewModel: document.getElementById("llm-review-model").value,
       sttMode: document.getElementById("stt-mode").value,
       whisperModel: document.getElementById("whisper-model").value,
       sttBaseUrl: document.getElementById("stt-base").value,
@@ -2144,6 +2140,17 @@ document.body.addEventListener("submit", async (event) => {
         state.settings = await api("/api/settings");
         showToast("Coach instructions updated");
       }
+      if (updated.notepadUpdated) {
+        const lead = await api(`/api/leads/${updated.leadId}`);
+        if (state.queue?.lead?.id === lead.id) {
+          state.queue.lead.notes = lead.notes;
+          state.draftNotes = lead.notes || "";
+          const notes = document.getElementById("notes");
+          if (notes) notes.value = state.draftNotes;
+        }
+        if (state.detail?.id === lead.id) state.detail = lead;
+        showToast("Notepad updated");
+      }
       paintCoach();
     } catch (error) {
       showToast(error.message);
@@ -2216,7 +2223,7 @@ document.getElementById("modal").addEventListener("click", (event) => {
 document.addEventListener("keydown", (event) => {
   if (event.key === "Escape") closeModal();
   const typing = ["INPUT", "TEXTAREA", "SELECT"].includes(document.activeElement?.tagName);
-  if (activeTour || state.view !== "dial" || typing || document.getElementById("modal")?.classList.contains("flex")) return;
+  if (state.view !== "dial" || typing || document.getElementById("modal")?.classList.contains("flex")) return;
   if ((event.key === " " || event.key === "Enter") && !state.paused) {
     event.preventDefault();
     const link = document.getElementById("dial-link");
@@ -2243,136 +2250,6 @@ setInterval(async () => {
   }
 }, 2000);
 
-let activeTour = null;
-
-const SETUP_TOUR = [
-  { title: "Set up MyDial", description: "Google Voice still places the call. This short tour shows what to configure once. You can replay it anytime from Walkthrough." },
-  { view: "dial", element: "[data-tour=quick-add]", side: "bottom", title: "Add a lead", description: "Name and phone are enough to start. A 10-digit US number gets a leading 1 so the Google Voice link is a full E.164 number." },
-  { view: "scripts", element: "[data-tour=scripts]", side: "bottom", title: "Write the talk track", description: "Sections and objections live on a script. {{first_name}} and {{company}} fill in when that script is open on the dialer." },
-  { view: "campaigns", element: "[data-tour=campaigns]", side: "bottom", title: "Build the campaign", description: "A flow can dial, wait, and file an email. Connect each dial outcome to the next step. With no flow saved, the linear cadence still retries." },
-  { view: "config", element: "[data-tour=voice]", side: "top", title: "Label the voice line", description: "The dial button opens Google Voice on this computer. The line label is just a reminder of which number you are using. Save it here." },
-  { view: "config", element: "[data-tour=models]", side: "top", title: "Choose the coach models", description: "Speech recognition stays in this browser until you switch it to a transcription URL. Add a chat model when you want live advice. This page says when audio or text will leave the machine. Keys stay on this computer." },
-  { view: "coach", element: "[data-tour=persona]", side: "right", title: "Set the coach persona", description: "Name, directness, what you sell, and standing instructions. Saying “be more direct” in a call thread updates those instructions too." },
-  { view: "coach", element: "[data-tour=playbooks]", side: "left", title: "Keep playbooks", description: "Playbooks, call reviews, and Wrong-button corrections are retrieved on later calls, including calls with other leads." },
-  { view: "dial", element: "[data-tour=dial-stage]", side: "right", title: "Dial from here", description: "Open Google Voice & Dial starts the call timer. Stop ends that timer. Keys 1–5 log the outcome and advance the queue. Space or Enter dials when you are not typing." },
-  { view: "dial", element: "[data-tour=coach-live]", side: "left", title: "Coach beside the call", description: "Your mic is Me when tab audio is shared. Shared tab audio is Prospect. After the prospect stops talking, the coach posts what to say next. Pause coach keeps the transcript. A review is written into this thread when you disposition." },
-];
-
-const PRODUCT_TOUR = [
-  { title: "Walk through MyDial", description: "A pass over the dialer, leads, inbox, campaigns, coach, and the local API. Close it any time. Walkthrough in the header starts it again." },
-  { view: "dial", element: "[data-tour=nav]", side: "bottom", title: "One local workspace", description: "Power dialer, leads, inbox, campaigns, scripts, coach, analytics, and API settings. Everything is stored in SQLite on this machine." },
-  { view: "dial", element: "[data-tour=dial-bar]", side: "bottom", title: "The dialing session", description: "Filter the queue by campaign. Skip moves to the next lead without an outcome. Pause queue stops dialing. The clock is this session, not the phone company’s timer." },
-  { view: "dial", element: "[data-tour=dial-stage]", side: "right", title: "The current lead", description: "The dial link opens Google Voice and starts the timer. Dispositions record the outcome, duration, and notes. The script and objections for the campaign sit on this card." },
-  { view: "dial", element: "[data-tour=coach-live]", side: "left", title: "Live coach", description: "Lines show up as they are recognized. Rename a speaker if a gatekeeper or a second person is on the line. Typed notes are to the coach. Each coach note has a Wrong button, and the reason is remembered." },
-  { view: "leads", element: "[data-tour=leads]", side: "bottom", title: "The directory", description: "Search, filter, import, and export. Select rows and enqueue them, or send the filtered list to the queue. Archive hides a lead without deleting the history." },
-  { view: "leads", element: "[data-tour=leads-table]", side: "top", title: "Open a lead", description: "Click a row for the record, score, and recent calls. Dial from the phone number. A call that had a coach thread can be reopened from Thread." },
-  { view: "inbox", element: "[data-tour=inbox]", side: "bottom", title: "Local email", description: "Compose, drafts, and replies stay here. No-answer and voicemail outcomes file a follow-up draft when the lead has an email. SMTP sends only after a mailbox is saved. Otherwise the message stays in the local outbox." },
-  { view: "inbox", element: "[data-tour=inbox-folders]", side: "right", title: "Folders and sending", description: "Needs reply, automated triggers, and paused threads are real folders. The mailbox form on this side stores the from address and SMTP password the same way as other secrets." },
-  { view: "campaigns", element: "[data-tour=campaigns]", side: "bottom", title: "Campaign flows", description: "The canvas is the path after each dial outcome. Wait steps hold a lead until they are due. Email steps file a draft, or send when SMTP and auto-send are on." },
-  { view: "scripts", element: "[data-tour=scripts]", side: "bottom", title: "Scripts", description: "Attach a script to a campaign and it is the one you read while dialing. Objections expand in place on the dialer." },
-  { view: "coach", element: "[data-tour=persona]", side: "right", title: "Persona", description: "This is who the coach is on every call. Instructions edited here, or in plain language during a call, are part of the next prompt." },
-  { view: "analytics", element: "[data-tour=analytics]", side: "bottom", title: "What was actually logged", description: "Counts, connect rate, and duration come from dispositions you saved. There is no separate score for the coach and no invented win rate." },
-  { view: "config", element: "[data-tour=voice]", side: "left", title: "API and Docker", description: "Run it with Docker, open Swagger, and try a GET from this page. The voice line label sits with the dial link." },
-  { view: "config", element: "[data-tour=webhooks]", side: "top", title: "Webhooks", description: "MyDial can POST when a lead is created, dialed, or dispositioned, and when an email is drafted or sent. A secret adds an HMAC signature header." },
-];
-
-function openWalkthrough() {
-  if (activeTour) {
-    activeTour.destroy();
-    activeTour = null;
-  }
-  openModal(`
-    <h2 class="text-lg font-semibold text-white">Walkthrough</h2>
-    <p class="mt-2 text-sm text-slate-400">Replay either tour whenever you want. Nothing is changed while you look.</p>
-    <div class="mt-4 grid gap-3">
-      <button type="button" data-action="start-tour" data-tour="setup" class="rounded-xl border border-line px-4 py-3 text-left hover:border-mint">
-        <span class="block text-sm font-semibold text-white">Initial setup</span>
-        <span class="mt-1 block text-xs text-slate-400">Lead, script, campaign, voice line, models, and the coach.</span>
-      </button>
-      <button type="button" data-action="start-tour" data-tour="product" class="rounded-xl border border-line px-4 py-3 text-left hover:border-mint">
-        <span class="block text-sm font-semibold text-white">Product tour</span>
-        <span class="mt-1 block text-xs text-slate-400">The dialer, directory, inbox, flows, coach, analytics, and webhooks.</span>
-      </button>
-    </div>
-  `);
-}
-
-async function startTour(kind) {
-  closeModal();
-  const create = window.driver?.js?.driver;
-  if (typeof create !== "function") {
-    showToast("The walkthrough library did not load. Check the network and reload.");
-    return;
-  }
-  if (activeTour) {
-    activeTour.destroy();
-    activeTour = null;
-  }
-  const steps = kind === "product" ? PRODUCT_TOUR : SETUP_TOUR;
-  let moving = false;
-  const markSeen = () => {
-    if (kind !== "product") localStorage.setItem("mydial.tour.setup", "done");
-  };
-  const tour = create({
-    animate: true,
-    smoothScroll: true,
-    showProgress: true,
-    progressText: "{{current}} of {{total}}",
-    nextBtnText: "Next",
-    prevBtnText: "Back",
-    doneBtnText: "Done",
-    allowClose: true,
-    overlayOpacity: 0.72,
-    stagePadding: 8,
-    stageRadius: 12,
-    popoverClass: "mydial-tour",
-    disableActiveInteraction: true,
-    onNextClick: () => { void shift(1); },
-    onPrevClick: () => { void shift(-1); },
-    onDestroyStarted: () => {
-      markSeen();
-      if (activeTour === tour) activeTour = null;
-      tour.destroy();
-    },
-    steps: steps.map((step) => ({
-      ...(step.element ? { element: step.element } : {}),
-      popover: {
-        title: step.title,
-        description: step.description,
-        side: step.side || "bottom",
-        align: "start",
-      },
-    })),
-  });
-  activeTour = tour;
-  async function shift(delta) {
-    if (moving || activeTour !== tour) return;
-    const index = tour.getActiveIndex() ?? 0;
-    const next = index + delta;
-    if (next < 0) return;
-    if (next >= steps.length) {
-      markSeen();
-      tour.destroy();
-      return;
-    }
-    moving = true;
-    try {
-      const step = steps[next];
-      if (step.view && step.view !== state.view) await showView(step.view);
-      if (activeTour === tour) tour.moveTo(next);
-    } catch (error) {
-      showToast(error.message);
-    } finally {
-      moving = false;
-    }
-  }
-  if (steps[0].view && steps[0].view !== state.view) await showView(steps[0].view);
-  tour.drive();
-}
-
-refreshCore().then(async () => {
-  await showView("dial");
-  if (!localStorage.getItem("mydial.tour.setup")) void startTour("setup");
-}).catch((error) => {
+refreshCore().then(() => showView("dial")).catch((error) => {
   document.getElementById("app").innerHTML = `<p class="p-8 text-rose-300">${esc(error.message)}</p>`;
 });
