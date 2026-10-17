@@ -425,7 +425,8 @@ function coachPrivacy(settings = state.settings) {
   const leaves = [];
   if (settings.sttMode === "remote") leaves.push("call audio is sent to the transcription URL");
   const localChat = settings.llmProvider === "ollama" || /localhost|127\.0\.0\.1/.test(settings.llmBaseUrl || "");
-  if (settings.llmModel && !localChat) leaves.push("the transcript and your notes are sent to the chat model");
+  const chatModel = settings.llmLiveModel || settings.llmReviewModel || settings.llmModel;
+  if (chatModel && !localChat) leaves.push("the transcript and your notes are sent to the chat model");
   const localEmbed = !settings.embedProvider || settings.embedProvider === "none" || settings.embedProvider === "ollama" || /localhost|127\.0\.0\.1/.test(settings.embedBaseUrl || "");
   if (!localEmbed) leaves.push("playbooks, reviews, and corrections are sent to the embedding model");
   if (!leaves.length) return "Speech recognition stays in this browser. A local chat model keeps the transcript on this machine.";
@@ -1139,11 +1140,12 @@ function renderConfig() {
         <div class="mt-3 grid gap-2">
           <label class="text-xs text-slate-400">Chat provider
             <select id="llm-provider" class="field mt-1">
-              ${["openai", "anthropic", "ollama", "compatible"].map((provider) => `<option value="${provider}" ${state.settings.llmProvider === provider ? "selected" : ""}>${provider}</option>`).join("")}
+              ${["ollama", "openai", "anthropic", "compatible"].map((provider) => `<option value="${provider}" ${state.settings.llmProvider === provider ? "selected" : ""}>${provider}</option>`).join("")}
             </select>
           </label>
-          <label class="text-xs text-slate-400">Chat base URL<input id="llm-base" class="field mt-1" value="${esc(state.settings.llmBaseUrl || "")}" placeholder="https://api.openai.com/v1"></label>
-          <label class="text-xs text-slate-400">Chat model<input id="llm-model" class="field mt-1" value="${esc(state.settings.llmModel || "")}" placeholder="gpt-4o-mini or llama3.1"></label>
+          <label class="text-xs text-slate-400">Chat base URL<input id="llm-base" class="field mt-1" value="${esc(state.settings.llmBaseUrl || "")}" placeholder="http://127.0.0.1:11434/v1"></label>
+          <label class="text-xs text-slate-400">Model during the call<input id="llm-live-model" class="field mt-1" value="${esc(state.settings.llmLiveModel || "")}" placeholder="qwen3.5:4b-mlx"></label>
+          <label class="text-xs text-slate-400">Model after the call<input id="llm-review-model" class="field mt-1" value="${esc(state.settings.llmReviewModel || "")}" placeholder="qwen3.5:9b-mlx"></label>
           <label class="text-xs text-slate-400">Chat API key<input id="llm-key" type="password" class="field mt-1" placeholder="${state.settings.llmApiKeySet ? "Saved — leave blank to keep" : "sk-..."}"></label>
           <label class="text-xs text-slate-400">Transcription
             <select id="stt-mode" class="field mt-1">
@@ -1983,7 +1985,8 @@ document.body.addEventListener("click", async (event) => {
     const payload = {
       llmProvider: document.getElementById("llm-provider").value,
       llmBaseUrl: document.getElementById("llm-base").value,
-      llmModel: document.getElementById("llm-model").value,
+      llmLiveModel: document.getElementById("llm-live-model").value,
+      llmReviewModel: document.getElementById("llm-review-model").value,
       sttMode: document.getElementById("stt-mode").value,
       whisperModel: document.getElementById("whisper-model").value,
       sttBaseUrl: document.getElementById("stt-base").value,
@@ -2136,6 +2139,17 @@ document.body.addEventListener("submit", async (event) => {
       if (updated.personaUpdated) {
         state.settings = await api("/api/settings");
         showToast("Coach instructions updated");
+      }
+      if (updated.notepadUpdated) {
+        const lead = await api(`/api/leads/${updated.leadId}`);
+        if (state.queue?.lead?.id === lead.id) {
+          state.queue.lead.notes = lead.notes;
+          state.draftNotes = lead.notes || "";
+          const notes = document.getElementById("notes");
+          if (notes) notes.value = state.draftNotes;
+        }
+        if (state.detail?.id === lead.id) state.detail = lead;
+        showToast("Notepad updated");
       }
       paintCoach();
     } catch (error) {

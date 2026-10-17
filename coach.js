@@ -55,6 +55,12 @@ export function registerCoach(app, { db, nowIso, getLead, settingValue, putSetti
       body TEXT NOT NULL,
       vector TEXT NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS coach_memories (
+      id TEXT PRIMARY KEY,
+      body TEXT NOT NULL,
+      lead_id TEXT NOT NULL DEFAULT '',
+      created_at TEXT NOT NULL
+    );
     CREATE INDEX IF NOT EXISTS idx_coach_sessions_lead ON coach_sessions (lead_id, created_at);
     CREATE INDEX IF NOT EXISTS idx_coach_messages_session ON coach_messages (session_id, created_at);
   `);
@@ -284,23 +290,95 @@ export function registerCoach(app, { db, nowIso, getLead, settingValue, putSetti
       .join("\n");
   }
 
-  function modelProblem() {
-    const provider = setting("llmProvider") || "openai";
-    const model = setting("llmModel");
+  function clipText(text, limit = 1500) {
+    const value = String(text || "");
+    if (value.length <= limit) return value;
+    return `${value.slice(0, limit)}\n…`;
+  }
+
+  function likeTerm(value) {
+    const cleaned = String(value || "").trim().slice(0, 80).replaceAll("%", "").replaceAll("_", "");
+    return `%${cleaned}%`;
+  }
+
+  function modelFor(mode) {
+    const provider = setting("llmProvider") || "ollama";
+    const stored = mode === "review" ? setting("llmReviewModel") : setting("llmLiveModel");
+    if (stored) return stored;
+    if (provider === "ollama") return mode === "review" ? "qwen3.5:9b-mlx" : "qwen3.5:4b-mlx";
+    return setting("llmModel");
+  }
+
+  function modelProblem(model) {
+    const provider = setting("llmProvider") || "ollama";
     const key = setting("llmApiKey");
     const base = setting("llmBaseUrl") || PROVIDER_BASES[provider] || "";
-    if (!model) return "Choose a chat model on API & Docker. Listening and the transcript still stay here.";
+    if (!model) return "Choose the coach models on API & Docker. Listening and the transcript still stay here.";
     const local = provider === "ollama" || /localhost|127\.0\.0\.1/.test(base);
     if (!local && !key) return "Add an API key for the chat model on API & Docker. The transcript is saved either way.";
     return "";
   }
 
-  async function chatComplete(messages) {
-    const problem = modelProblem();
-    if (problem) throw new Error(problem);
-    const provider = setting("llmProvider") || "openai";
-    const model = setting("llmModel");
+  function messageText(message) {
+    const content = message?.content;
+    if (typeof content === "string") return content.trim();
+    if (Array.isArray(content)) return content.map((part) => part.text || part.content || "").join("\n").trim();
+    return "";
+  }
+
+  function toOllamaMessages(messages) {
+    return messages.map((message) => {
+      if (message.role === "tool") {
+        return { role: "tool", tool_name: message.tool_name, content: message.content || "" };
+      }
+      if (message.role === "assistant" && message.tool_calls) {
+        return {
+          role: "assistant",
+          content: message.content || "",
+          tool_calls: message.tool_calls.map((call) => ({
+            id: call.id,
+            function: {
+              name: call.function?.name,
+              arguments: typeof call.function?.arguments === "string"
+                ? JSON.parse(call.function.arguments || "{}")
+                : (call.function?.arguments || {}),
+            },
+          })),
+        };
+      }
+      return { role: message.role, content: typeof message.content === "string" ? message.content : "" };
+    });
+  }
+
+  async function completeOnce(messages, { model, maxTokens, tools, think, keepAlive }) {
+    const provider = setting("llmProvider") || "ollama";
     const key = setting("llmApiKey");
+    if (provider === "ollama") {
+      const origin = (setting("llmBaseUrl") || PROVIDER_BASES.ollama).replace(/\/$/, "").replace(/\/v1$/, "");
+      const response = await fetchWithTimeout(`${origin}/api/chat`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          model,
+          messages: toOllamaMessages(messages),
+          tools: tools || undefined,
+          think: false,
+          stream: false,
+          keep_alive: keepAlive,
+          options: { temperature: 0.4, num_predict: maxTokens },
+        }),
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(payload.error || "The chat model rejected the request.");
+      const message = payload.message || {};
+      return {
+        content: message.content || "",
+        tool_calls: (message.tool_calls || []).map((call) => ({
+          id: call.id,
+          function: { name: call.function?.name, arguments: call.function?.arguments || {} },
+        })),
+      };
+    }
     if (provider === "anthropic") {
       const system = messages.filter((message) => message.role === "system").map((message) => message.content).join("\n\n");
       const response = await fetchWithTimeout("https://api.anthropic.com/v1/messages", {
@@ -312,28 +390,234 @@ export function registerCoach(app, { db, nowIso, getLead, settingValue, putSetti
         },
         body: JSON.stringify({
           model,
-          max_tokens: 700,
+          max_tokens: maxTokens,
           system,
           messages: anthropicMessages(messages),
         }),
       });
       const payload = await response.json().catch(() => ({}));
       if (!response.ok) throw new Error(payload.error?.message || "The Anthropic model rejected the request.");
-      return payload.content?.map((part) => part.text || "").join("\n").trim();
+      return { content: payload.content?.map((part) => part.text || "").join("\n").trim() || "" };
     }
     const base = (setting("llmBaseUrl") || PROVIDER_BASES[provider] || "").replace(/\/$/, "");
     if (!base) throw new Error("Add a base URL for this chat model.");
+    const body = { model, temperature: 0.4, max_tokens: maxTokens, messages };
+    if (tools) body.tools = tools;
     const response = await fetchWithTimeout(`${base}/chat/completions`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
         ...(key ? { Authorization: `Bearer ${key}` } : {}),
       },
-      body: JSON.stringify({ model, temperature: 0.4, messages }),
+      body: JSON.stringify(body),
     });
     const payload = await response.json().catch(() => ({}));
     if (!response.ok) throw new Error(payload.error?.message || "The chat model rejected the request.");
-    return String(payload.choices?.[0]?.message?.content || "").trim();
+    return payload.choices?.[0]?.message || { content: "" };
+  }
+
+  function toolSpec(name, description, properties, required) {
+    return {
+      type: "function",
+      function: {
+        name,
+        description,
+        parameters: { type: "object", properties, required },
+      },
+    };
+  }
+
+  function toolList(mode) {
+    const tools = [
+      toolSpec("search_leads", "Find leads by name, company, phone, or email. Leave query blank to list recent leads.", { query: { type: "string" } }, []),
+      toolSpec("get_lead", "Read one lead, including recent call outcomes.", { id: { type: "string" } }, ["id"]),
+      toolSpec("recent_calls", "List recent calls. Pass a lead id to limit the list to that lead.", { leadId: { type: "string" } }, []),
+      toolSpec("list_scripts", "List call script names.", {}, []),
+      toolSpec("get_script", "Read one script, including sections and objections.", { id: { type: "string" } }, ["id"]),
+      toolSpec("list_campaigns", "List campaigns with status and how many leads are queued.", {}, []),
+      toolSpec("search_inbox", "Search email subjects and bodies.", { query: { type: "string" } }, ["query"]),
+      toolSpec("queue_snapshot", "Say how many leads are queued and name the next few.", {}, []),
+      toolSpec("search_memory", "Search playbooks, reviews, corrections, and coach memory.", { query: { type: "string" } }, ["query"]),
+      toolSpec("remember", "Save a fact the coach should recall on later calls, including other leads.", { text: { type: "string" } }, ["text"]),
+    ];
+    if (mode === "note") {
+      tools.push(toolSpec(
+        "append_notepad",
+        "Append one line to the current lead's notepad. Use only when the typed note asks to save something there. This does not change status, queue, phone, or disposition.",
+        { text: { type: "string" } },
+        ["text"],
+      ));
+    }
+    return tools;
+  }
+
+  function recentMemoryText() {
+    const rows = db.prepare("SELECT body FROM coach_memories ORDER BY created_at DESC LIMIT 5").all().reverse();
+    return rows.map((row) => row.body).join("\n");
+  }
+
+  function runTool(name, args, { leadId, effects }) {
+    const input = args && typeof args === "object" ? args : {};
+    if (name === "search_leads") {
+      const query = String(input.query || "").trim();
+      const term = likeTerm(query);
+      const rows = query
+        ? db.prepare(`
+          SELECT id, name, company, phone, email, status, attempts
+          FROM leads
+          WHERE name LIKE ? OR company LIKE ? OR phone LIKE ? OR email LIKE ?
+          ORDER BY updated_at DESC
+          LIMIT 8
+        `).all(term, term, term, term)
+        : db.prepare(`
+          SELECT id, name, company, phone, email, status, attempts
+          FROM leads
+          ORDER BY updated_at DESC
+          LIMIT 8
+        `).all();
+      if (!rows.length) return "No leads matched.";
+      return rows.map((row) => `${row.name} | ${row.company || "no company"} | ${row.phone} | ${row.status} | attempts ${row.attempts} | id ${row.id}`).join("\n");
+    }
+    if (name === "get_lead") {
+      const lead = getLead(String(input.id || leadId || ""));
+      if (!lead) return "That lead is not in the database.";
+      const calls = (lead.calls || []).slice(0, 4).map((call) => `${call.outcome} ${call.durationSeconds || 0}s ${call.notes || ""}`.trim()).join("; ");
+      return [
+        `${lead.name} | ${lead.company || "no company"} | ${lead.phone} | ${lead.email || "no email"}`,
+        `Status ${lead.status}. Attempts ${lead.attempts}.`,
+        lead.notes ? `Notepad: ${clipText(lead.notes, 400)}` : "Notepad is empty.",
+        calls ? `Recent calls: ${calls}` : "No calls logged.",
+      ].join("\n");
+    }
+    if (name === "recent_calls") {
+      const id = String(input.leadId || "").trim();
+      const rows = id
+        ? db.prepare("SELECT lead_name, outcome, duration_seconds, notes, ended_at FROM call_logs WHERE lead_id = ? ORDER BY ended_at DESC LIMIT 8").all(id)
+        : db.prepare("SELECT lead_name, outcome, duration_seconds, notes, ended_at FROM call_logs ORDER BY ended_at DESC LIMIT 8").all();
+      if (!rows.length) return "No calls logged.";
+      return rows.map((row) => `${row.ended_at} | ${row.lead_name} | ${row.outcome} | ${row.duration_seconds}s | ${clipText(row.notes, 160)}`).join("\n");
+    }
+    if (name === "list_scripts") {
+      const rows = db.prepare("SELECT id, name FROM scripts ORDER BY name LIMIT 20").all();
+      if (!rows.length) return "No scripts saved.";
+      return rows.map((row) => `${row.name} | id ${row.id}`).join("\n");
+    }
+    if (name === "get_script") {
+      const row = db.prepare("SELECT * FROM scripts WHERE id = ?").get(String(input.id || ""));
+      if (!row) return "That script is not in the database.";
+      const objections = db.prepare("SELECT label, response FROM objections WHERE script_id = ? ORDER BY sort_order, label").all(row.id);
+      let sections = "";
+      try {
+        const parsed = JSON.parse(row.sections_json || "[]");
+        if (Array.isArray(parsed)) sections = parsed.map((section) => `${section.label}: ${section.text}`).join("\n");
+      } catch { /* body fallback */ }
+      return [`Script ${row.name}`, clipText(sections || row.body, 900), objections.length ? `Objections:\n${objections.map((item) => `${item.label}: ${item.response}`).join("\n")}` : ""].filter(Boolean).join("\n");
+    }
+    if (name === "list_campaigns") {
+      const rows = db.prepare(`
+        SELECT campaigns.id, campaigns.name, campaigns.status,
+          (SELECT COUNT(*) FROM leads WHERE leads.campaign_id = campaigns.id AND leads.in_queue = 1 AND leads.archived = 0) AS queued
+        FROM campaigns
+        ORDER BY campaigns.name
+        LIMIT 20
+      `).all();
+      if (!rows.length) return "No campaigns saved.";
+      return rows.map((row) => `${row.name} | ${row.status} | ${row.queued} queued | id ${row.id}`).join("\n");
+    }
+    if (name === "search_inbox") {
+      const query = String(input.query || "").trim();
+      if (!query) return "Say what to search for.";
+      const term = likeTerm(query);
+      const rows = db.prepare(`
+        SELECT emails.subject, emails.body, emails.direction, emails.status
+        FROM emails
+        LEFT JOIN email_threads ON email_threads.id = emails.thread_id
+        WHERE emails.subject LIKE ? OR emails.body LIKE ? OR email_threads.subject LIKE ?
+        ORDER BY emails.created_at DESC
+        LIMIT 6
+      `).all(term, term, term);
+      if (!rows.length) return "No emails matched.";
+      return rows.map((row) => `${row.direction} | ${row.status} | ${row.subject} | ${clipText(row.body, 180)}`).join("\n");
+    }
+    if (name === "queue_snapshot") {
+      const count = db.prepare("SELECT COUNT(*) AS count FROM leads WHERE in_queue = 1 AND archived = 0").get().count;
+      const rows = db.prepare("SELECT name, company FROM leads WHERE in_queue = 1 AND archived = 0 ORDER BY queue_order ASC LIMIT 5").all();
+      const names = rows.map((row) => row.company ? `${row.name} (${row.company})` : row.name).join(", ");
+      return `${count} queued.${names ? ` Next: ${names}.` : ""}`;
+    }
+    if (name === "remember") {
+      const text = String(input.text || "").trim().slice(0, 1000);
+      if (!text) return "Nothing to remember.";
+      const id = crypto.randomUUID();
+      db.prepare("INSERT INTO coach_memories (id, body, lead_id, created_at) VALUES (?, ?, ?, ?)").run(id, text, leadId || "", nowIso());
+      saveDoc(`memory:${id}`, "memory", text);
+      return "Saved to coach memory.";
+    }
+    if (name === "append_notepad") {
+      if (!leadId) return "There is no current lead.";
+      const line = String(input.text || "").replace(/\s+/g, " ").trim().slice(0, 500);
+      if (!line) return "Nothing to add.";
+      const lead = db.prepare("SELECT notes FROM leads WHERE id = ?").get(leadId);
+      if (!lead) return "That lead is not in the database.";
+      const next = lead.notes ? `${lead.notes}\n${line}` : line;
+      db.prepare("UPDATE leads SET notes = ?, updated_at = ? WHERE id = ?").run(next, nowIso(), leadId);
+      if (effects) effects.notepadUpdated = true;
+      return "Added to this lead's notepad.";
+    }
+    return "That tool is not available.";
+  }
+
+  async function chatComplete(messages, { mode = "turn", leadId = "", effects = null } = {}) {
+    const model = modelFor(mode);
+    const problem = modelProblem(model);
+    if (problem) throw new Error(problem);
+    const provider = setting("llmProvider") || "ollama";
+    const limits = { turn: 180, note: 400, review: 700 };
+    const maxTokens = limits[mode] || 400;
+    const keepAlive = mode === "review" ? "2m" : "30m";
+    const tools = mode === "turn" || provider === "anthropic" ? null : toolList(mode);
+    if (!tools) {
+      const message = await completeOnce(messages, { model, maxTokens, think: provider === "ollama" ? false : undefined, keepAlive });
+      return { text: messageText(message), toolsUsed: [] };
+    }
+    const convo = messages.map((message) => ({ ...message }));
+    const toolsUsed = [];
+    for (let round = 0; round < 3; round += 1) {
+      const message = await completeOnce(convo, {
+        model,
+        maxTokens,
+        tools: round < 2 ? tools : null,
+        think: false,
+        keepAlive,
+      });
+      const calls = Array.isArray(message.tool_calls) ? message.tool_calls : [];
+      if (!calls.length) return { text: messageText(message), toolsUsed };
+      convo.push({ role: "assistant", content: messageText(message), tool_calls: calls });
+      for (const call of calls) {
+        const name = call.function?.name || "";
+        let args = call.function?.arguments || {};
+        if (typeof args === "string") {
+          try { args = JSON.parse(args || "{}"); } catch { args = {}; }
+        }
+        toolsUsed.push(name);
+        let result = "The tool failed.";
+        try {
+          result = name === "search_memory"
+            ? await memoryToolResult(String(args.query || ""))
+            : runTool(name, args, { leadId, effects });
+        } catch (error) {
+          result = error.message;
+        }
+        convo.push({ role: "tool", tool_name: name, tool_call_id: call.id || name, content: clipText(result) });
+      }
+    }
+    return { text: "", toolsUsed };
+  }
+
+  async function memoryToolResult(query) {
+    const hits = await retrieve(query);
+    if (!hits.length) return "Nothing in memory matched.";
+    return hits.map((hit) => `(${hit.kind}) ${hit.body}`).join("\n---\n");
   }
 
   async function transcribeRemote(buffer) {
@@ -357,13 +641,23 @@ export function registerCoach(app, { db, nowIso, getLead, settingValue, putSetti
     return /\b(be more|be less|more direct|less direct|from now on|your name is|call yourself|don't mention|do not mention|sound more|talk like|keep it|persona|shorter|warmer|tougher)\b/i.test(text);
   }
 
+  function fitInstructions(text) {
+    const limit = 2000;
+    if (text.length <= limit) return text;
+    const lines = text.split("\n");
+    while (lines.length > 1 && lines.join("\n").length > limit) lines.shift();
+    let fitted = lines.join("\n");
+    if (fitted.length > limit) fitted = fitted.slice(fitted.length - limit).trimStart();
+    return fitted.trim();
+  }
+
   function rememberPersona(text) {
     const previous = setting("coachInstructions");
     const next = previous ? `${previous}\n${text}` : text;
-    putSetting("coachInstructions", next.length > 2000 ? text : next);
+    putSetting("coachInstructions", fitInstructions(next));
   }
 
-  async function coachTurn(sessionId, { mode = "turn", outcome = "", notes = "" } = {}) {
+  async function coachTurn(sessionId, { mode = "turn", outcome = "", notes = "", effects = null } = {}) {
     const row = sessionRow(sessionId);
     if (!row) return null;
     const current = mapSession(row);
@@ -372,22 +666,24 @@ export function registerCoach(app, { db, nowIso, getLead, settingValue, putSetti
     const lessonText = lessons.length
       ? lessons.map((hit) => `(${hit.kind}) ${hit.body}`).join("\n---\n")
       : "No saved playbook sections, reviews, or corrections matched this call.";
+    const memoryText = recentMemoryText();
     const profile = persona();
     const task = mode === "review"
-      ? "Write the post-call review. Cover what went well and what to change next time. No scores or percentages. Use short paragraphs."
+      ? "Write the post-call review. Cover what went well and what to change next time. No scores or percentages. Use short paragraphs. You may look up the database and save a memory. Do not change the lead."
       : mode === "note"
-        ? "Answer the latest note written to you. If it changes how you should coach, confirm that in one sentence. Add what to say next only when the transcript has a prospect turn."
-        : "The prospect just finished a turn. In 2 to 4 sentences, say what Me should say next and why.";
+        ? "Answer only the latest note. Look up the database when that note depends on leads, calls, scripts, campaigns, inbox, the queue, or memory. If it asks to add or save something on the notepad, call append_notepad before you answer. If it asks you to remember a fact for later calls, call remember before you answer. Do not say you saved anything unless the tool result says you did. Add what to say next only when the transcript has a prospect turn."
+        : "The prospect just finished a turn. In 2 to 4 sentences, say what Me should say next and why. Do not call tools.";
     const system = [
       `You are ${profile.name}, a live sales coach sitting beside the caller.`,
       `Directness: ${profile.directness}.`,
       profile.product ? `What they sell: ${profile.product}.` : "",
       `Standing instructions:\n${profile.instructions}`,
       "The caller is labeled Me. Everyone else uses the speaker name in the transcript.",
-      "Do not invent scores, win rates, or facts that are not in the context.",
+      "Do not invent scores, win rates, or facts that are not in the context or in a tool result.",
       "Do not speak as if you are on the phone. Write to Me.",
       task,
       `Lead and script:\n${leadContext(row.lead_id)}`,
+      memoryText ? `Recent coach memory:\n${memoryText}` : "",
       `Retrieved playbooks, reviews, and corrections:\n${lessonText}`,
     ].filter(Boolean).join("\n\n");
     const conversation = [{ role: "system", content: system }];
@@ -397,17 +693,29 @@ export function registerCoach(app, { db, nowIso, getLead, settingValue, putSetti
         role: "user",
         content: `The call is over. Outcome: ${outcome || "unspecified"}. Notepad: ${notes || "empty"}.\n\nTranscript:\n${lines || "(no transcript)"}`,
       });
+    } else if (mode === "note") {
+      const latest = [...current.messages].reverse().find((message) => message.kind === "note");
+      conversation.push({
+        role: "user",
+        content: `Transcript:\n${lines || "(no transcript)"}\n\nLatest note to answer:\n${latest?.body || ""}`,
+      });
     } else if (lines) {
       conversation.push({ role: "user", content: lines });
     }
     let body;
     let answered = false;
+    let toolsUsed = [];
     try {
-      body = await chatComplete(conversation);
+      const result = await chatComplete(conversation, { mode, leadId: row.lead_id, effects });
+      body = result.text;
+      toolsUsed = result.toolsUsed;
       answered = true;
       if (!body) body = "The model returned an empty note.";
     } catch (error) {
       body = error.message;
+    }
+    if (toolsUsed.length) {
+      addMessage(sessionId, { kind: "status", speaker: "Coach", body: `Used ${toolsUsed.join(", ")}.` });
     }
     addMessage(sessionId, { kind: mode === "review" ? "review" : "coach", speaker: profile.name, body });
     if (mode === "review" && answered) {
@@ -641,9 +949,10 @@ export function registerCoach(app, { db, nowIso, getLead, settingValue, putSetti
       rememberPersona(text.slice(0, 500));
       personaUpdated = true;
     }
-    if (!row.paused) await coachTurn(row.id, { mode: "note" });
+    const effects = { notepadUpdated: false };
+    if (!row.paused) await coachTurn(row.id, { mode: "note", effects });
     const session = mapSession(sessionRow(row.id));
-    res.json({ ...session, personaUpdated });
+    res.json({ ...session, personaUpdated, notepadUpdated: effects.notepadUpdated });
     } catch (error) {
       console.error(error);
       if (!res.headersSent) res.status(500).json({ error: "The coach could not answer that note." });

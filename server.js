@@ -670,8 +670,10 @@ app.get("/api/health", (_req, res) => {
 
 const SECRET_SETTINGS = new Set(["smtpPass", "llmApiKey", "sttApiKey", "embedApiKey"]);
 const SETTING_DEFAULTS = {
-  llmProvider: "openai",
-  llmBaseUrl: "https://api.openai.com/v1",
+  llmProvider: "ollama",
+  llmBaseUrl: "http://127.0.0.1:11434/v1",
+  llmLiveModel: "qwen3.5:4b-mlx",
+  llmReviewModel: "qwen3.5:9b-mlx",
   sttMode: "local",
   sttBaseUrl: "https://api.openai.com/v1",
   sttModel: "whisper-1",
@@ -708,7 +710,7 @@ app.patch("/api/settings", (req, res) => {
   const put = db.prepare("INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value");
   for (const key of [
     "gvLine", "mailFromName", "mailFromEmail", "smtpHost", "smtpPort", "smtpUser",
-    "llmProvider", "llmBaseUrl", "llmModel", "sttMode", "sttBaseUrl", "sttModel", "whisperModel",
+    "llmProvider", "llmBaseUrl", "llmModel", "llmLiveModel", "llmReviewModel", "sttMode", "sttBaseUrl", "sttModel", "whisperModel",
     "embedProvider", "embedBaseUrl", "embedModel", "coachName", "coachDirectness", "coachProduct", "coachInstructions",
   ]) {
     if (req.body?.[key] !== undefined) put.run(`setting.${key}`, String(req.body[key]).trim());
