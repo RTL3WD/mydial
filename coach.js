@@ -1,6 +1,7 @@
 import fs from "fs";
 import path from "path";
 import crypto from "crypto";
+import { attachCoachThread, prepareCoachThread } from "./coach-thread.js";
 
 const PROVIDER_BASES = {
   openai: "https://api.openai.com/v1",
@@ -69,6 +70,7 @@ export function registerCoach(app, { db, nowIso, getLead, settingValue, putSetti
   } catch (error) {
     console.error("Coach full-text search is unavailable:", error.message);
   }
+  prepareCoachThread(db);
 
   const reviewJobs = new Map();
 
@@ -81,10 +83,12 @@ export function registerCoach(app, { db, nowIso, getLead, settingValue, putSetti
     return { id: row.id, name: row.name, body: row.body, createdAt: row.created_at, updatedAt: row.updated_at };
   }
 
-  function mapMessage(row) {
+  function mapMessage(row, sibling = {}) {
     const corrections = db.prepare(
       "SELECT id, reason, created_at AS createdAt FROM coach_corrections WHERE message_id = ? ORDER BY created_at"
     ).all(row.id);
+    let meta = {};
+    try { meta = JSON.parse(row.meta_json || "{}"); } catch { meta = {}; }
     return {
       id: row.id,
       sessionId: row.session_id,
@@ -93,14 +97,55 @@ export function registerCoach(app, { db, nowIso, getLead, settingValue, putSetti
       body: row.body,
       hasAudio: Boolean(row.audio_path),
       createdAt: row.created_at,
+      rating: row.rating || "",
+      meta,
+      siblingIndex: sibling.siblingIndex || 1,
+      siblingCount: sibling.siblingCount || 1,
+      siblingIds: sibling.siblingIds || [row.id],
       corrections,
     };
+  }
+
+  function mapMessages(sessionId) {
+    const rows = db.prepare("SELECT * FROM coach_messages WHERE session_id = ? ORDER BY created_at, rowid").all(sessionId);
+    const groups = new Map();
+    for (const row of rows) {
+      const group = row.sibling_of || row.id;
+      if (!groups.has(group)) groups.set(group, []);
+      groups.get(group).push(row);
+    }
+    const visible = [];
+    const seen = new Set();
+    for (const row of rows) {
+      const group = row.sibling_of || row.id;
+      if (seen.has(group)) continue;
+      seen.add(group);
+      const members = groups.get(group);
+      const active = members.find((item) => item.active) || members[members.length - 1];
+      visible.push(mapMessage(active, {
+        siblingIndex: members.findIndex((item) => item.id === active.id) + 1,
+        siblingCount: members.length,
+        siblingIds: members.map((item) => item.id),
+      }));
+    }
+    return visible;
   }
 
   function mapSession(row) {
     if (!row) return null;
     const lead = db.prepare("SELECT name, company FROM leads WHERE id = ?").get(row.lead_id);
-    const messages = db.prepare("SELECT * FROM coach_messages WHERE session_id = ? ORDER BY created_at, rowid").all(row.id).map(mapMessage);
+    const root = row.root_id || row.id;
+    const branchRows = db.prepare(`
+      SELECT id, created_at FROM coach_sessions
+      WHERE id = ? OR root_id = ?
+      ORDER BY created_at, rowid
+    `).all(root, root);
+    let side = 0;
+    const branches = branchRows.map((item) => ({
+      id: item.id,
+      createdAt: item.created_at,
+      label: item.id === root ? "Original" : `Branch ${side += 1}`,
+    }));
     return {
       id: row.id,
       leadId: row.lead_id,
@@ -111,7 +156,10 @@ export function registerCoach(app, { db, nowIso, getLead, settingValue, putSetti
       reviewStatus: row.review_status,
       createdAt: row.created_at,
       endedAt: row.ended_at,
-      messages,
+      rootId: root,
+      pendingSteer: row.pending_steer || "",
+      branches,
+      messages: mapMessages(row.id),
     };
   }
 
@@ -119,14 +167,28 @@ export function registerCoach(app, { db, nowIso, getLead, settingValue, putSetti
     return db.prepare("SELECT * FROM coach_sessions WHERE id = ?").get(id);
   }
 
-  function addMessage(sessionId, { kind, speaker, body, audioPath = "" }) {
+  function addMessage(sessionId, { kind, speaker, body, audioPath = "", siblingOf = "", createdAt = "", meta = null, active = 1 }) {
     const id = crypto.randomUUID();
-    const createdAt = nowIso();
     db.prepare(`
-      INSERT INTO coach_messages (id, session_id, kind, speaker, body, audio_path, created_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?)
-    `).run(id, sessionId, kind, speaker, body, audioPath, createdAt);
+      INSERT INTO coach_messages (id, session_id, kind, speaker, body, audio_path, created_at, sibling_of, active, rating, meta_json)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, '', ?)
+    `).run(id, sessionId, kind, speaker, body, audioPath, createdAt || nowIso(), siblingOf, active ? 1 : 0, meta ? JSON.stringify(meta) : "");
+    if (siblingOf) {
+      db.prepare(`
+        UPDATE coach_messages
+        SET active = CASE WHEN id = ? THEN 1 ELSE 0 END
+        WHERE session_id = ? AND (id = ? OR sibling_of = ?)
+      `).run(id, sessionId, siblingOf, siblingOf);
+    }
     return id;
+  }
+
+  function rememberLine(text, leadId) {
+    const cleaned = String(text || "").trim().slice(0, 1000);
+    if (!cleaned) return;
+    const id = crypto.randomUUID();
+    db.prepare("INSERT INTO coach_memories (id, body, lead_id, created_at) VALUES (?, ?, ?, ?)").run(id, cleaned, leadId || "", nowIso());
+    saveDoc(`memory:${id}`, "memory", cleaned);
   }
 
   function saveAudio(messageId, audioBase64) {
@@ -350,9 +412,48 @@ export function registerCoach(app, { db, nowIso, getLead, settingValue, putSetti
     });
   }
 
-  async function completeOnce(messages, { model, maxTokens, tools, think, keepAlive }) {
+  function absorbToolCalls(bucket, incoming) {
+    incoming.forEach((call, index) => {
+      const slot = Number.isInteger(call.index) ? call.index : index;
+      if (!bucket[slot]) bucket[slot] = { id: call.id || "", function: { name: "", arguments: "" } };
+      const item = bucket[slot];
+      if (call.id) item.id = call.id;
+      const fn = call.function || {};
+      if (fn.name && !item.function.name) item.function.name = fn.name;
+      if (typeof fn.arguments === "string") item.function.arguments += fn.arguments;
+      else if (fn.arguments && typeof fn.arguments === "object") item.function.arguments = fn.arguments;
+    });
+  }
+
+  async function readModelStream(response, onPayload) {
+    const reader = response.body?.getReader();
+    if (!reader) {
+      onPayload(await response.json().catch(() => ({})));
+      return;
+    }
+    const decoder = new TextDecoder();
+    let buffer = "";
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      let split = buffer.indexOf("\n");
+      while (split >= 0) {
+        const line = buffer.slice(0, split).trim();
+        buffer = buffer.slice(split + 1);
+        split = buffer.indexOf("\n");
+        if (!line || line.startsWith("event:") || line.startsWith(":")) continue;
+        const data = line.startsWith("data:") ? line.slice(5).trim() : line;
+        if (!data || data === "[DONE]") continue;
+        try { onPayload(JSON.parse(data)); } catch { /* wait for the next chunk */ }
+      }
+    }
+  }
+
+  async function completeOnce(messages, { model, maxTokens, tools, think, keepAlive, onDelta }) {
     const provider = setting("llmProvider") || "ollama";
     const key = setting("llmApiKey");
+    const streaming = typeof onDelta === "function";
     if (provider === "ollama") {
       const origin = (setting("llmBaseUrl") || PROVIDER_BASES.ollama).replace(/\/$/, "").replace(/\/v1$/, "");
       const response = await fetchWithTimeout(`${origin}/api/chat`, {
@@ -363,21 +464,41 @@ export function registerCoach(app, { db, nowIso, getLead, settingValue, putSetti
           messages: toOllamaMessages(messages),
           tools: tools || undefined,
           think: false,
-          stream: false,
+          stream: streaming,
           keep_alive: keepAlive,
           options: { temperature: 0.4, num_predict: maxTokens },
         }),
+      }, streaming ? 90000 : 45000);
+      if (!streaming) {
+        const payload = await response.json().catch(() => ({}));
+        if (!response.ok) throw new Error(payload.error || "The chat model rejected the request.");
+        const message = payload.message || {};
+        return {
+          content: message.content || "",
+          tool_calls: (message.tool_calls || []).map((call) => ({
+            id: call.id,
+            function: { name: call.function?.name, arguments: call.function?.arguments || {} },
+          })),
+        };
+      }
+      if (!response.ok) {
+        const payload = await response.json().catch(() => ({}));
+        throw new Error(payload.error || "The chat model rejected the request.");
+      }
+      let content = "";
+      const toolCalls = [];
+      let streamError = "";
+      await readModelStream(response, (payload) => {
+        if (payload.error) streamError = typeof payload.error === "string" ? payload.error : "The chat model rejected the request.";
+        const message = payload.message || {};
+        if (message.content) {
+          content += message.content;
+          onDelta(message.content);
+        }
+        if (Array.isArray(message.tool_calls) && message.tool_calls.length) absorbToolCalls(toolCalls, message.tool_calls);
       });
-      const payload = await response.json().catch(() => ({}));
-      if (!response.ok) throw new Error(payload.error || "The chat model rejected the request.");
-      const message = payload.message || {};
-      return {
-        content: message.content || "",
-        tool_calls: (message.tool_calls || []).map((call) => ({
-          id: call.id,
-          function: { name: call.function?.name, arguments: call.function?.arguments || {} },
-        })),
-      };
+      if (streamError) throw new Error(streamError);
+      return { content, tool_calls: toolCalls.filter((call) => call?.function?.name) };
     }
     if (provider === "anthropic") {
       const system = messages.filter((message) => message.role === "system").map((message) => message.content).join("\n\n");
@@ -392,17 +513,34 @@ export function registerCoach(app, { db, nowIso, getLead, settingValue, putSetti
           model,
           max_tokens: maxTokens,
           system,
+          stream: streaming,
           messages: anthropicMessages(messages),
         }),
+      }, streaming ? 90000 : 45000);
+      if (!streaming) {
+        const payload = await response.json().catch(() => ({}));
+        if (!response.ok) throw new Error(payload.error?.message || "The Anthropic model rejected the request.");
+        return { content: payload.content?.map((part) => part.text || "").join("\n").trim() || "" };
+      }
+      if (!response.ok) {
+        const payload = await response.json().catch(() => ({}));
+        throw new Error(payload.error?.message || "The Anthropic model rejected the request.");
+      }
+      let content = "";
+      await readModelStream(response, (payload) => {
+        const text = payload.delta?.text || "";
+        if (payload.type === "content_block_delta" && text) {
+          content += text;
+          onDelta(text);
+        }
       });
-      const payload = await response.json().catch(() => ({}));
-      if (!response.ok) throw new Error(payload.error?.message || "The Anthropic model rejected the request.");
-      return { content: payload.content?.map((part) => part.text || "").join("\n").trim() || "" };
+      return { content };
     }
     const base = (setting("llmBaseUrl") || PROVIDER_BASES[provider] || "").replace(/\/$/, "");
     if (!base) throw new Error("Add a base URL for this chat model.");
     const body = { model, temperature: 0.4, max_tokens: maxTokens, messages };
     if (tools) body.tools = tools;
+    if (streaming) body.stream = true;
     const response = await fetchWithTimeout(`${base}/chat/completions`, {
       method: "POST",
       headers: {
@@ -410,10 +548,27 @@ export function registerCoach(app, { db, nowIso, getLead, settingValue, putSetti
         ...(key ? { Authorization: `Bearer ${key}` } : {}),
       },
       body: JSON.stringify(body),
+    }, streaming ? 90000 : 45000);
+    if (!streaming) {
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(payload.error?.message || "The chat model rejected the request.");
+      return payload.choices?.[0]?.message || { content: "" };
+    }
+    if (!response.ok) {
+      const payload = await response.json().catch(() => ({}));
+      throw new Error(payload.error?.message || "The chat model rejected the request.");
+    }
+    let content = "";
+    const toolCalls = [];
+    await readModelStream(response, (payload) => {
+      const delta = payload.choices?.[0]?.delta || {};
+      if (delta.content) {
+        content += delta.content;
+        onDelta(delta.content);
+      }
+      if (Array.isArray(delta.tool_calls) && delta.tool_calls.length) absorbToolCalls(toolCalls, delta.tool_calls);
     });
-    const payload = await response.json().catch(() => ({}));
-    if (!response.ok) throw new Error(payload.error?.message || "The chat model rejected the request.");
-    return payload.choices?.[0]?.message || { content: "" };
+    return { content, tool_calls: toolCalls.filter((call) => call?.function?.name) };
   }
 
   function toolSpec(name, description, properties, required) {
@@ -557,17 +712,22 @@ export function registerCoach(app, { db, nowIso, getLead, settingValue, putSetti
       if (!leadId) return "There is no current lead.";
       const line = String(input.text || "").replace(/\s+/g, " ").trim().slice(0, 500);
       if (!line) return "Nothing to add.";
-      const lead = db.prepare("SELECT notes FROM leads WHERE id = ?").get(leadId);
+      const lead = db.prepare("SELECT id FROM leads WHERE id = ?").get(leadId);
       if (!lead) return "That lead is not in the database.";
-      const next = lead.notes ? `${lead.notes}\n${line}` : line;
-      db.prepare("UPDATE leads SET notes = ?, updated_at = ? WHERE id = ?").run(next, nowIso(), leadId);
+      const timestamp = nowIso();
+      db.prepare(`
+        INSERT INTO lead_notes (id, lead_id, body, author, call_log_id, tags, created_at, updated_at)
+        VALUES (?, ?, ?, 'coach', '', '', ?, ?)
+      `).run(crypto.randomUUID(), leadId, line, timestamp, timestamp);
+      const bodies = db.prepare("SELECT body FROM lead_notes WHERE lead_id = ? ORDER BY created_at, rowid").all(leadId).map((row) => row.body);
+      db.prepare("UPDATE leads SET notes = ?, updated_at = ? WHERE id = ?").run(bodies.join("\n"), timestamp, leadId);
       if (effects) effects.notepadUpdated = true;
-      return "Added to this lead's notepad.";
+      return "Added to this lead's notes.";
     }
     return "That tool is not available.";
   }
 
-  async function chatComplete(messages, { mode = "turn", leadId = "", effects = null } = {}) {
+  async function chatComplete(messages, { mode = "turn", leadId = "", effects = null, onEvent = null } = {}) {
     const model = modelFor(mode);
     const problem = modelProblem(model);
     if (problem) throw new Error(problem);
@@ -576,22 +736,39 @@ export function registerCoach(app, { db, nowIso, getLead, settingValue, putSetti
     const maxTokens = limits[mode] || 400;
     const keepAlive = mode === "review" ? "2m" : "30m";
     const tools = mode === "turn" || provider === "anthropic" ? null : toolList(mode);
+    const emit = (event) => {
+      try { onEvent?.(event); } catch { /* the browser can leave mid-reply */ }
+    };
+    const streamedOnce = async (input, toolsForRound) => {
+      let sent = false;
+      const message = await completeOnce(input, {
+        model,
+        maxTokens,
+        tools: toolsForRound,
+        think: false,
+        keepAlive,
+        onDelta: onEvent
+          ? (text) => {
+            if (!text) return;
+            sent = true;
+            emit({ type: "delta", text });
+          }
+          : undefined,
+      });
+      return { message, sent };
+    };
     if (!tools) {
-      const message = await completeOnce(messages, { model, maxTokens, think: provider === "ollama" ? false : undefined, keepAlive });
+      const { message } = await streamedOnce(messages, null);
       return { text: messageText(message), toolsUsed: [] };
     }
     const convo = messages.map((message) => ({ ...message }));
     const toolsUsed = [];
     for (let round = 0; round < 3; round += 1) {
-      const message = await completeOnce(convo, {
-        model,
-        maxTokens,
-        tools: round < 2 ? tools : null,
-        think: false,
-        keepAlive,
-      });
+      const { message, sent } = await streamedOnce(convo, round < 2 ? tools : null);
       const calls = Array.isArray(message.tool_calls) ? message.tool_calls : [];
       if (!calls.length) return { text: messageText(message), toolsUsed };
+      if (sent) emit({ type: "reset" });
+      emit({ type: "status", body: "Looking that up…" });
       convo.push({ role: "assistant", content: messageText(message), tool_calls: calls });
       for (const call of calls) {
         const name = call.function?.name || "";
@@ -657,10 +834,14 @@ export function registerCoach(app, { db, nowIso, getLead, settingValue, putSetti
     putSetting("coachInstructions", fitInstructions(next));
   }
 
-  async function coachTurn(sessionId, { mode = "turn", outcome = "", notes = "", effects = null } = {}) {
+  async function coachTurn(sessionId, { mode = "turn", outcome = "", notes = "", effects = null, onEvent = null, noteId = "", untilMessageId = "", siblingOf = "", siblingCreatedAt = "", continueBody = "", returnText = false } = {}) {
     const row = sessionRow(sessionId);
     if (!row) return null;
     const current = mapSession(row);
+    if (untilMessageId) {
+      const until = db.prepare("SELECT created_at FROM coach_messages WHERE id = ?").get(untilMessageId);
+      if (until) current.messages = current.messages.filter((message) => message.createdAt < until.created_at);
+    }
     const spoken = current.messages.filter((message) => message.kind === "prospect" || message.kind === "note").map((message) => message.body).join(" ");
     const lessons = await retrieve(`${spoken}\n${current.leadCompany}\n${outcome}`);
     const lessonText = lessons.length
@@ -670,8 +851,10 @@ export function registerCoach(app, { db, nowIso, getLead, settingValue, putSetti
     const profile = persona();
     const task = mode === "review"
       ? "Write the post-call review. Cover what went well and what to change next time. No scores or percentages. Use short paragraphs. You may look up the database and save a memory. Do not change the lead."
+      : mode === "continue"
+        ? "Continue the coach reply. Do not repeat sentences already written. Add one to three sentences."
       : mode === "note"
-        ? "Answer only the latest note. Look up the database when that note depends on leads, calls, scripts, campaigns, inbox, the queue, or memory. If it asks to add or save something on the notepad, call append_notepad before you answer. If it asks you to remember a fact for later calls, call remember before you answer. Do not say you saved anything unless the tool result says you did. Add what to say next only when the transcript has a prospect turn."
+        ? "Answer only the latest note. If the transcript has no prospect lines yet, this is pre-call prep: help Me plan the opener, the angle, and the objections to expect for this lead. Look up the database when that note depends on leads, calls, scripts, campaigns, inbox, the queue, or memory. If it asks to add or save something on the notepad, call append_notepad before you answer. If it asks you to remember a fact for later calls, call remember before you answer. Do not say you saved anything unless the tool result says you did. Once a prospect has spoken, add what to say next."
         : "The prospect just finished a turn. In 2 to 4 sentences, say what Me should say next and why. Do not call tools.";
     const system = [
       `You are ${profile.name}, a live sales coach sitting beside the caller.`,
@@ -682,19 +865,23 @@ export function registerCoach(app, { db, nowIso, getLead, settingValue, putSetti
       "Do not invent scores, win rates, or facts that are not in the context or in a tool result.",
       "Do not speak as if you are on the phone. Write to Me.",
       task,
+      row.pending_steer ? `Direction Me just signaled. Apply it in this reply, and do not mention that a button was clicked:\n${row.pending_steer}` : "",
       `Lead and script:\n${leadContext(row.lead_id)}`,
       memoryText ? `Recent coach memory:\n${memoryText}` : "",
       `Retrieved playbooks, reviews, and corrections:\n${lessonText}`,
     ].filter(Boolean).join("\n\n");
     const conversation = [{ role: "system", content: system }];
     const lines = transcript(current.messages);
-    if (mode === "review") {
+    const focusedNote = noteId ? current.messages.find((message) => message.id === noteId) : null;
+    if (mode === "continue") {
+      conversation.push({ role: "user", content: `Coach reply so far:\n${continueBody}` });
+    } else if (mode === "review") {
       conversation.push({
         role: "user",
         content: `The call is over. Outcome: ${outcome || "unspecified"}. Notepad: ${notes || "empty"}.\n\nTranscript:\n${lines || "(no transcript)"}`,
       });
     } else if (mode === "note") {
-      const latest = [...current.messages].reverse().find((message) => message.kind === "note");
+      const latest = focusedNote || [...current.messages].reverse().find((message) => message.kind === "note");
       conversation.push({
         role: "user",
         content: `Transcript:\n${lines || "(no transcript)"}\n\nLatest note to answer:\n${latest?.body || ""}`,
@@ -705,8 +892,9 @@ export function registerCoach(app, { db, nowIso, getLead, settingValue, putSetti
     let body;
     let answered = false;
     let toolsUsed = [];
+    const started = Date.now();
     try {
-      const result = await chatComplete(conversation, { mode, leadId: row.lead_id, effects });
+      const result = await chatComplete(conversation, { mode: mode === "continue" ? "note" : mode, leadId: row.lead_id, effects, onEvent });
       body = result.text;
       toolsUsed = result.toolsUsed;
       answered = true;
@@ -714,10 +902,20 @@ export function registerCoach(app, { db, nowIso, getLead, settingValue, putSetti
     } catch (error) {
       body = error.message;
     }
-    if (toolsUsed.length) {
+    const meta = { model: modelFor(mode === "continue" ? "note" : mode), ms: Date.now() - started, tools: toolsUsed };
+    if (row.pending_steer) db.prepare("UPDATE coach_sessions SET pending_steer = '' WHERE id = ?").run(sessionId);
+    if (returnText) return { body, meta };
+    if (toolsUsed.length && !siblingOf) {
       addMessage(sessionId, { kind: "status", speaker: "Coach", body: `Used ${toolsUsed.join(", ")}.` });
     }
-    addMessage(sessionId, { kind: mode === "review" ? "review" : "coach", speaker: profile.name, body });
+    addMessage(sessionId, {
+      kind: mode === "review" ? "review" : "coach",
+      speaker: profile.name,
+      body,
+      siblingOf,
+      createdAt: siblingCreatedAt,
+      meta,
+    });
     if (mode === "review" && answered) {
       const reviewId = db.prepare("SELECT id FROM coach_messages WHERE session_id = ? AND kind = 'review' ORDER BY created_at DESC LIMIT 1").get(sessionId)?.id;
       if (reviewId) saveDoc(`review:${reviewId}`, "review", `${current.leadName}: ${body}`);
@@ -768,26 +966,28 @@ export function registerCoach(app, { db, nowIso, getLead, settingValue, putSetti
     scheduleReview(row.id, 12000);
   }
 
+  function deleteSessionRecord(sessionId) {
+    const messages = db.prepare("SELECT id, audio_path FROM coach_messages WHERE session_id = ?").all(sessionId);
+    for (const message of messages) {
+      const corrections = db.prepare("SELECT id FROM coach_corrections WHERE message_id = ?").all(message.id);
+      for (const correction of corrections) {
+        db.prepare("DELETE FROM coach_docs WHERE source_id = ?").run(`correction:${correction.id}`);
+        db.prepare("DELETE FROM coach_vectors WHERE source_id = ?").run(`correction:${correction.id}`);
+      }
+      db.prepare("DELETE FROM coach_corrections WHERE message_id = ?").run(message.id);
+      db.prepare("DELETE FROM coach_docs WHERE source_id = ?").run(`review:${message.id}`);
+      db.prepare("DELETE FROM coach_vectors WHERE source_id = ?").run(`review:${message.id}`);
+      if (message.audio_path) {
+        fs.rmSync(path.join(audioDir, path.basename(message.audio_path)), { force: true });
+      }
+    }
+    db.prepare("DELETE FROM coach_messages WHERE session_id = ?").run(sessionId);
+    db.prepare("DELETE FROM coach_sessions WHERE id = ?").run(sessionId);
+  }
+
   function deleteLeadCoach(leadId) {
     const sessions = db.prepare("SELECT id FROM coach_sessions WHERE lead_id = ?").all(leadId);
-    for (const session of sessions) {
-      const messages = db.prepare("SELECT id, audio_path FROM coach_messages WHERE session_id = ?").all(session.id);
-      for (const message of messages) {
-        const corrections = db.prepare("SELECT id FROM coach_corrections WHERE message_id = ?").all(message.id);
-        for (const correction of corrections) {
-          db.prepare("DELETE FROM coach_docs WHERE source_id = ?").run(`correction:${correction.id}`);
-          db.prepare("DELETE FROM coach_vectors WHERE source_id = ?").run(`correction:${correction.id}`);
-        }
-        db.prepare("DELETE FROM coach_corrections WHERE message_id = ?").run(message.id);
-        db.prepare("DELETE FROM coach_docs WHERE source_id = ?").run(`review:${message.id}`);
-        db.prepare("DELETE FROM coach_vectors WHERE source_id = ?").run(`review:${message.id}`);
-        if (message.audio_path) {
-          fs.rmSync(path.join(audioDir, path.basename(message.audio_path)), { force: true });
-        }
-      }
-      db.prepare("DELETE FROM coach_messages WHERE session_id = ?").run(session.id);
-    }
-    db.prepare("DELETE FROM coach_sessions WHERE lead_id = ?").run(leadId);
+    for (const session of sessions) deleteSessionRecord(session.id);
     rebuildFts();
   }
 
@@ -844,14 +1044,36 @@ export function registerCoach(app, { db, nowIso, getLead, settingValue, putSetti
       return;
     }
     const open = db.prepare(`
-      SELECT * FROM coach_sessions WHERE lead_id = ? AND ended_at IS NULL ORDER BY created_at DESC LIMIT 1
+      SELECT * FROM coach_sessions
+      WHERE lead_id = ? AND ended_at IS NULL AND (root_id = '' OR root_id = id)
+      ORDER BY created_at DESC LIMIT 1
     `).get(lead.id);
     if (open) {
       res.json(mapSession(open));
       return;
     }
     const id = crypto.randomUUID();
-    db.prepare("INSERT INTO coach_sessions (id, lead_id, created_at) VALUES (?, ?, ?)").run(id, lead.id, nowIso());
+    db.prepare("INSERT INTO coach_sessions (id, lead_id, root_id, created_at) VALUES (?, ?, ?, ?)").run(id, lead.id, id, nowIso());
+    res.status(201).json(mapSession(sessionRow(id)));
+  });
+
+  app.post("/api/coach/sessions/:id/reset", (req, res) => {
+    const row = sessionRow(req.params.id);
+    if (!row) {
+      res.status(404).json({ error: "Coach thread not found." });
+      return;
+    }
+    const root = row.root_id || row.id;
+    const family = db.prepare("SELECT id FROM coach_sessions WHERE id = ? OR root_id = ?").all(root, root);
+    for (const session of family) {
+      const job = reviewJobs.get(session.id);
+      if (job) clearTimeout(job.timer);
+      reviewJobs.delete(session.id);
+      deleteSessionRecord(session.id);
+    }
+    rebuildFts();
+    const id = crypto.randomUUID();
+    db.prepare("INSERT INTO coach_sessions (id, lead_id, root_id, created_at) VALUES (?, ?, ?, ?)").run(id, row.lead_id, id, nowIso());
     res.status(201).json(mapSession(sessionRow(id)));
   });
 
@@ -866,7 +1088,9 @@ export function registerCoach(app, { db, nowIso, getLead, settingValue, putSetti
 
   app.get("/api/coach/leads/:id/open", (req, res) => {
     const row = db.prepare(`
-      SELECT * FROM coach_sessions WHERE lead_id = ? AND ended_at IS NULL ORDER BY created_at DESC LIMIT 1
+      SELECT * FROM coach_sessions
+      WHERE lead_id = ? AND ended_at IS NULL AND (root_id = '' OR root_id = id)
+      ORDER BY created_at DESC LIMIT 1
     `).get(req.params.id);
     res.json({ session: mapSession(row) });
   });
@@ -891,6 +1115,25 @@ export function registerCoach(app, { db, nowIso, getLead, settingValue, putSetti
     }
     res.json(mapSession(sessionRow(row.id)));
   });
+
+  function wantsCoachStream(req) {
+    return String(req.headers.accept || "").includes("text/event-stream") || req.body?.stream === true;
+  }
+
+  function openCoachStream(res) {
+    res.writeHead(200, {
+      "Content-Type": "text/event-stream; charset=utf-8",
+      "Cache-Control": "no-cache, no-transform",
+      Connection: "keep-alive",
+      "X-Accel-Buffering": "no",
+    });
+    res.flushHeaders?.();
+    res.socket?.setNoDelay?.(true);
+    return (event) => {
+      if (res.writableEnded) return;
+      res.write(`data: ${JSON.stringify(event)}\n\n`);
+    };
+  }
 
   app.post("/api/coach/sessions/:id/utterances", async (req, res) => {
     try {
@@ -921,13 +1164,26 @@ export function registerCoach(app, { db, nowIso, getLead, settingValue, putSetti
     }
     db.prepare("UPDATE coach_messages SET body = ? WHERE id = ?").run(text || "(no words recognized)", messageId);
     const isProspect = speaker.toLowerCase() !== "me";
-    if (isProspect && text && !row.paused) {
-      await coachTurn(row.id);
+    const reply = isProspect && text && !row.paused;
+    if (!wantsCoachStream(req)) {
+      if (reply) await coachTurn(row.id);
+      res.json(mapSession(sessionRow(row.id)));
+      return;
     }
-    res.json(mapSession(sessionRow(row.id)));
+    const send = openCoachStream(res);
+    if (reply) {
+      send({ type: "start" });
+      await coachTurn(row.id, { onEvent: send });
+    }
+    send({ type: "done", session: mapSession(sessionRow(row.id)) });
+    res.end();
     } catch (error) {
       console.error(error);
       if (!res.headersSent) res.status(500).json({ error: "The coach could not save that line." });
+      else if (!res.writableEnded) {
+        res.write(`data: ${JSON.stringify({ type: "error", error: "The coach could not save that line." })}\n\n`);
+        res.end();
+      }
     }
   });
 
@@ -950,12 +1206,29 @@ export function registerCoach(app, { db, nowIso, getLead, settingValue, putSetti
       personaUpdated = true;
     }
     const effects = { notepadUpdated: false };
-    if (!row.paused) await coachTurn(row.id, { mode: "note", effects });
-    const session = mapSession(sessionRow(row.id));
-    res.json({ ...session, personaUpdated, notepadUpdated: effects.notepadUpdated });
+    if (!wantsCoachStream(req)) {
+      if (!row.paused) await coachTurn(row.id, { mode: "note", effects });
+      const session = mapSession(sessionRow(row.id));
+      res.json({ ...session, personaUpdated, notepadUpdated: effects.notepadUpdated });
+      return;
+    }
+    const send = openCoachStream(res);
+    send({ type: "start" });
+    if (!row.paused) await coachTurn(row.id, { mode: "note", effects, onEvent: send });
+    send({
+      type: "done",
+      session: mapSession(sessionRow(row.id)),
+      personaUpdated,
+      notepadUpdated: effects.notepadUpdated,
+    });
+    res.end();
     } catch (error) {
       console.error(error);
       if (!res.headersSent) res.status(500).json({ error: "The coach could not answer that note." });
+      else if (!res.writableEnded) {
+        res.write(`data: ${JSON.stringify({ type: "error", error: "The coach could not answer that note." })}\n\n`);
+        res.end();
+      }
     }
   });
 
@@ -1018,6 +1291,19 @@ export function registerCoach(app, { db, nowIso, getLead, settingValue, putSetti
     }
     res.type("audio/wav");
     fs.createReadStream(full).pipe(res);
+  });
+
+  attachCoachThread(app, {
+    db,
+    nowIso,
+    sessionRow,
+    mapSession,
+    coachTurn,
+    addMessage,
+    saveDoc,
+    rememberLine,
+    openCoachStream,
+    wantsCoachStream,
   });
 
   return { reviewAfterDisposition, deleteLeadCoach };

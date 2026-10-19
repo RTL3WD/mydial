@@ -1,6 +1,6 @@
 import express from "express";
 import { DatabaseSync } from "node:sqlite";
-import { createHmac } from "node:crypto";
+import { createHmac, randomUUID } from "node:crypto";
 import nodemailer from "nodemailer";
 import swaggerUi from "swagger-ui-express";
 import fs from "fs";
@@ -115,6 +115,54 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_leads_status ON leads(status);
   CREATE INDEX IF NOT EXISTS idx_call_logs_ended ON call_logs(ended_at);
 `);
+
+db.exec(`
+  CREATE TABLE IF NOT EXISTS lead_notes (
+    id TEXT PRIMARY KEY,
+    lead_id TEXT NOT NULL,
+    body TEXT NOT NULL,
+    author TEXT NOT NULL DEFAULT 'me',
+    call_log_id TEXT NOT NULL DEFAULT '',
+    tags TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS idx_lead_notes_lead ON lead_notes(lead_id, created_at);
+`);
+
+function mapLeadNote(row) {
+  if (!row) return null;
+  return {
+    id: row.id,
+    leadId: row.lead_id,
+    body: row.body,
+    author: row.author,
+    callLogId: row.call_log_id || "",
+    tags: String(row.tags || "").split(",").map((tag) => tag.trim()).filter(Boolean),
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
+function syncLeadNotepad(leadId) {
+  const bodies = db.prepare("SELECT body FROM lead_notes WHERE lead_id = ? ORDER BY created_at, rowid").all(leadId).map((row) => row.body);
+  db.prepare("UPDATE leads SET notes = ?, updated_at = ? WHERE id = ?").run(bodies.join("\n"), nowIso(), leadId);
+}
+
+function seedLeadNotes() {
+  const rows = db.prepare("SELECT id, notes, updated_at FROM leads WHERE TRIM(notes) != ''").all();
+  const insert = db.prepare(`
+    INSERT INTO lead_notes (id, lead_id, body, author, call_log_id, tags, created_at, updated_at)
+    VALUES (?, ?, ?, 'me', '', '', ?, ?)
+  `);
+  for (const row of rows) {
+    const count = db.prepare("SELECT COUNT(*) AS count FROM lead_notes WHERE lead_id = ?").get(row.id).count;
+    if (count) continue;
+    insert.run(randomUUID(), row.id, row.notes, row.updated_at || nowIso(), row.updated_at || nowIso());
+  }
+}
+
+seedLeadNotes();
 
 function addColumn(table, column, definition) {
   const columns = db.prepare(`PRAGMA table_info(${table})`).all();
@@ -1017,6 +1065,80 @@ app.get("/api/leads/:id", (req, res) => {
   res.json({ ...lead, calls, script: scriptForCampaign(lead.campaignId) });
 });
 
+app.get("/api/leads/:id/notes", (req, res) => {
+  const lead = db.prepare("SELECT id FROM leads WHERE id = ?").get(req.params.id);
+  if (!lead) {
+    res.status(404).json({ error: "Lead not found." });
+    return;
+  }
+  const rows = db.prepare(`
+    SELECT lead_notes.*, call_logs.outcome AS call_outcome, call_logs.ended_at AS call_ended_at
+    FROM lead_notes
+    LEFT JOIN call_logs ON call_logs.id = lead_notes.call_log_id
+    WHERE lead_notes.lead_id = ?
+    ORDER BY lead_notes.created_at DESC, lead_notes.rowid DESC
+  `).all(req.params.id);
+  res.json(rows.map((row) => ({
+    ...mapLeadNote(row),
+    callOutcome: row.call_outcome || "",
+    callEndedAt: row.call_ended_at || "",
+  })));
+});
+
+app.post("/api/leads/:id/notes", (req, res) => {
+  const lead = db.prepare("SELECT id FROM leads WHERE id = ?").get(req.params.id);
+  if (!lead) {
+    res.status(404).json({ error: "Lead not found." });
+    return;
+  }
+  const body = String(req.body?.body || "").trim().slice(0, 4000);
+  if (!body) {
+    res.status(400).json({ error: "Write a note first." });
+    return;
+  }
+  const author = ["me", "coach", "system"].includes(req.body?.author) ? req.body.author : "me";
+  const tags = (Array.isArray(req.body?.tags) ? req.body.tags : []).map((tag) => String(tag).trim()).filter(Boolean).slice(0, 8);
+  const id = randomUUID();
+  const timestamp = nowIso();
+  db.prepare(`
+    INSERT INTO lead_notes (id, lead_id, body, author, call_log_id, tags, created_at, updated_at)
+    VALUES (?, ?, ?, ?, '', ?, ?, ?)
+  `).run(id, lead.id, body, author, tags.join(", "), timestamp, timestamp);
+  syncLeadNotepad(lead.id);
+  const row = db.prepare("SELECT * FROM lead_notes WHERE id = ?").get(id);
+  res.status(201).json(mapLeadNote(row));
+});
+
+app.patch("/api/lead-notes/:id", (req, res) => {
+  const existing = db.prepare("SELECT * FROM lead_notes WHERE id = ?").get(req.params.id);
+  if (!existing) {
+    res.status(404).json({ error: "Note not found." });
+    return;
+  }
+  const body = req.body?.body !== undefined ? String(req.body.body).trim().slice(0, 4000) : existing.body;
+  if (!body) {
+    res.status(400).json({ error: "A note cannot be empty." });
+    return;
+  }
+  const tags = Array.isArray(req.body?.tags)
+    ? req.body.tags.map((tag) => String(tag).trim()).filter(Boolean).slice(0, 8).join(", ")
+    : existing.tags;
+  db.prepare("UPDATE lead_notes SET body = ?, tags = ?, updated_at = ? WHERE id = ?").run(body, tags, nowIso(), existing.id);
+  syncLeadNotepad(existing.lead_id);
+  res.json(mapLeadNote(db.prepare("SELECT * FROM lead_notes WHERE id = ?").get(existing.id)));
+});
+
+app.delete("/api/lead-notes/:id", (req, res) => {
+  const existing = db.prepare("SELECT * FROM lead_notes WHERE id = ?").get(req.params.id);
+  if (!existing) {
+    res.status(404).json({ error: "Note not found." });
+    return;
+  }
+  db.prepare("DELETE FROM lead_notes WHERE id = ?").run(existing.id);
+  syncLeadNotepad(existing.lead_id);
+  res.json({ id: existing.id, leadId: existing.lead_id });
+});
+
 app.patch("/api/leads/:id", (req, res) => {
   const existing = db.prepare("SELECT * FROM leads WHERE id = ?").get(req.params.id);
   if (!existing) {
@@ -1098,6 +1220,7 @@ app.delete("/api/leads/:id", (req, res) => {
   }
   db.prepare("DELETE FROM email_threads WHERE lead_id = ?").run(lead.id);
   deleteLeadCoach(lead.id);
+  db.prepare("DELETE FROM lead_notes WHERE lead_id = ?").run(lead.id);
   db.prepare("DELETE FROM leads WHERE id = ?").run(lead.id);
   res.json(lead);
 });
@@ -1128,10 +1251,15 @@ app.post("/api/leads/:id/disposition", (req, res) => {
     res.status(400).json({ error: "Unknown disposition." });
     return;
   }
-  const notes = req.body?.notes !== undefined ? String(req.body.notes) : existing.notes;
   const duration = durationSeconds(req.body?.durationSeconds);
   const endedAt = nowIso();
   const startedAt = req.body?.startedAt || new Date(Date.now() - duration * 1000).toISOString();
+  const duringCall = db.prepare(`
+    SELECT id, body FROM lead_notes
+    WHERE lead_id = ? AND call_log_id = '' AND created_at >= ? AND created_at <= ?
+    ORDER BY created_at
+  `).all(existing.id, startedAt, endedAt);
+  const notes = duringCall.length ? duringCall.map((note) => note.body).join("\n") : "";
   const campaignRow = existing.campaignId
     ? db.prepare("SELECT cadence_json, flow_json FROM campaigns WHERE id = ?").get(existing.campaignId)
     : null;
@@ -1155,7 +1283,7 @@ app.post("/api/leads/:id/disposition", (req, res) => {
         notes = ?, status = ?, stage = ?, in_queue = ?, queue_order = ?, next_attempt_at = ?, updated_at = ?
       WHERE id = ?
     `).run(
-      notes,
+      existing.notes || "",
       rule.status,
       rule.stage,
       inQueue,
@@ -1175,6 +1303,11 @@ app.post("/api/leads/:id/disposition", (req, res) => {
   });
   save();
   if (flow) advanceFromDial(existing.id, outcome, existing.attempts);
+  if (callLogId && duringCall.length) {
+    const mark = db.prepare("UPDATE lead_notes SET call_log_id = ? WHERE id = ?");
+    for (const note of duringCall) mark.run(callLogId, note.id);
+  }
+  syncLeadNotepad(existing.id);
   if (outcome === "dnc" || outcome === "not_interested") {
     db.prepare("UPDATE email_threads SET triggers_paused = 1, updated_at = ? WHERE lead_id = ?").run(nowIso(), existing.id);
   }

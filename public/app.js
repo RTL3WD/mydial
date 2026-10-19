@@ -56,6 +56,15 @@ const state = {
   selected: new Set(),
   detail: null,
   draftNotes: "",
+  dialTab: "chat",
+  leadsTab: "profile",
+  leadModal: false,
+  recordNotes: [],
+  profileDirty: false,
+  noteEdit: null,
+  noteTags: [],
+  noteDraft: "",
+  profileDraft: null,
   draftId: null,
   saveState: "idle",
   dialStartedAt: null,
@@ -81,6 +90,10 @@ const state = {
   coachSession: null,
   coachPin: false,
   coachStatus: "",
+  coachActions: [],
+  coachEdit: null,
+  coachInfo: null,
+  coachLiveId: null,
   playbooks: [],
   playbookId: null,
   wrongFor: null,
@@ -238,21 +251,70 @@ async function api(path, options = {}) {
   return data;
 }
 
+async function consumeCoachStream(path, body, handlers = {}) {
+  const res = await fetch(path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Accept: "text/event-stream" },
+    body: JSON.stringify({ ...body, stream: true }),
+  });
+  const type = res.headers.get("content-type") || "";
+  if (!type.includes("text/event-stream")) {
+    const text = await res.text();
+    let data = {};
+    try { data = text ? JSON.parse(text) : {}; } catch { data = {}; }
+    if (!res.ok) throw new Error(data.error || "Request failed.");
+    const payload = { type: "done", session: data, personaUpdated: data.personaUpdated, notepadUpdated: data.notepadUpdated };
+    handlers.onDone?.(payload);
+    return payload;
+  }
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let donePayload = null;
+  const take = (chunk) => {
+    const line = chunk.split("\n").filter((item) => item.startsWith("data:")).map((item) => item.slice(5).trim()).join("");
+    if (!line) return;
+    const event = JSON.parse(line);
+    if (event.type === "start") handlers.onStart?.();
+    else if (event.type === "delta") handlers.onDelta?.(event.text || "");
+    else if (event.type === "reset") handlers.onReset?.();
+    else if (event.type === "status") handlers.onStatus?.(event.body || "");
+    else if (event.type === "error") throw new Error(event.error || "The coach could not finish that reply.");
+    else if (event.type === "done") {
+      donePayload = event;
+      handlers.onDone?.(event);
+    }
+  };
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const chunks = buffer.split("\n\n");
+    buffer = chunks.pop() || "";
+    for (const chunk of chunks) take(chunk);
+  }
+  if (buffer.trim()) take(buffer);
+  if (!donePayload) throw new Error("The coach reply stopped before it finished.");
+  return donePayload;
+}
+
 function campaignById(id) {
   return state.campaigns.find((campaign) => campaign.id === id) || null;
 }
 
 async function refreshCore() {
-  const [stats, campaigns, scripts, settings] = await Promise.all([
+  const [stats, campaigns, scripts, settings, coachActions] = await Promise.all([
     api("/api/stats"),
     api("/api/campaigns"),
     api("/api/scripts"),
     api("/api/settings"),
+    api("/api/coach/actions").catch(() => []),
   ]);
   state.stats = stats;
   state.campaigns = campaigns;
   state.scripts = scripts;
   state.settings = settings;
+  state.coachActions = coachActions;
 }
 
 async function loadQueue() {
@@ -267,6 +329,7 @@ async function loadQueue() {
     state.dialStartedAt = null;
   }
   await syncCoachToQueue();
+  if (lead && state.view === "dial") await loadRecordNotes(lead.id);
 }
 
 async function loadLeads() {
@@ -404,12 +467,12 @@ function renderDial() {
     </section>
     <div class="mb-4 h-1.5 overflow-hidden rounded-full bg-panel"><div class="h-full bg-mint" style="width:${progress}%"></div></div>
     ${lead ? renderFocus(lead, campaign) : `
-      <section class="grid items-start gap-4 xl:grid-cols-[minmax(0,1fr)_400px]">
+      <section class="grid items-start gap-4 xl:grid-cols-[minmax(0,3fr)_minmax(280px,2fr)]">
+        ${state.coachSession ? coachPanel(null) : ""}
         <section class="rounded-2xl border border-dashed border-line px-8 py-16 text-center">
           <h2 class="text-2xl font-semibold text-white">Queue is clear</h2>
           <p class="mt-2 text-sm text-slate-400">${ready === 0 && state.queue.waiting ? "Leads are waiting on the cadence window or a retry backoff." : "Add a lead or send a filtered list into the queue."}</p>
         </section>
-        ${state.coachSession ? coachPanel(null) : ""}
       </section>
     `}
     <footer class="mt-4 flex flex-wrap gap-4 border-t border-line pt-3 text-xs text-slate-400">
@@ -433,11 +496,70 @@ function coachPrivacy(settings = state.settings) {
   return `Leaves this machine: ${leaves.join("; ")}.`;
 }
 
+function coachSvg(name) {
+  const paths = {
+    edit: '<path d="M4 16.5V19h2.5L17 8.5 14.5 6 4 16.5z"/><path d="M13 7.5l2.5 2.5"/>',
+    copy: '<rect x="8" y="8" width="10" height="10" rx="1.5"/><path d="M6 14H5.5A1.5 1.5 0 0 1 4 12.5v-8A1.5 1.5 0 0 1 5.5 3h8A1.5 1.5 0 0 1 15 4.5V6"/>',
+    info: '<circle cx="11" cy="11" r="7"/><path d="M11 10v5"/><path d="M11 7.5h.01"/>',
+    branch: '<circle cx="6" cy="5" r="2"/><circle cx="6" cy="17" r="2"/><circle cx="16" cy="11" r="2"/><path d="M6 7v8"/><path d="M8 11h6"/>',
+    up: '<path d="M7 11v7h3l1-4h4.2a1.5 1.5 0 0 0 1.5-1.8l-.8-4A1.5 1.5 0 0 0 14.4 7H11l.4-2.2A1.6 1.6 0 0 0 9.8 3L7 8"/>',
+    down: '<path d="M7 11V4h3l1 4h4.2a1.5 1.5 0 0 1 1.5 1.8l-.8 4a1.5 1.5 0 0 1-1.5 1.2H11l.4 2.2A1.6 1.6 0 0 1 9.8 19L7 14"/>',
+    play: '<path d="M8 5.5v11l9-5.5-9-5.5z"/>',
+    regen: '<path d="M16.5 8A6 6 0 1 0 17 13"/><path d="M16.5 4.5V8H13"/>',
+  };
+  return `<svg viewBox="0 0 22 22" class="h-4 w-4" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">${paths[name] || ""}</svg>`;
+}
+
+function coachToolButton(name, label, id, on = false) {
+  return `<button type="button" title="${esc(label)}" aria-label="${esc(label)}" data-action="coach-${name}" data-id="${esc(id)}" class="rounded p-1 ${on ? "text-mint" : "text-slate-400 hover:bg-white/5 hover:text-slate-100"}">${coachSvg(name === "edit" ? "edit" : name === "copy" ? "copy" : name === "info" ? "info" : name === "branch" ? "branch" : name === "up" ? "up" : name === "down" ? "down" : name === "continue" ? "play" : "regen")}</button>`;
+}
+
+function messageActions(message) {
+  const custom = (state.coachActions || []).filter((action) => action.enabled && action.placement === "message" && (action.kinds || []).includes(message.kind));
+  const buttons = [coachToolButton("copy", "Copy", message.id)];
+  buttons.push(coachToolButton("edit", "Edit", message.id));
+  if (message.kind === "coach") {
+    buttons.push(
+      coachToolButton("info", "Details", message.id, state.coachInfo === message.id),
+      coachToolButton("branch", "Branch", message.id),
+      coachToolButton("up", "Good reply", message.id, message.rating === "up"),
+      coachToolButton("down", "Wrong", message.id, message.rating === "down" || state.wrongFor === message.id),
+      coachToolButton("continue", "Continue", message.id),
+      coachToolButton("regen", "Regenerate", message.id),
+    );
+  } else if (message.kind === "review") {
+    buttons.push(
+      coachToolButton("info", "Details", message.id, state.coachInfo === message.id),
+      coachToolButton("up", "Good reply", message.id, message.rating === "up"),
+      coachToolButton("down", "Wrong", message.id, message.rating === "down" || state.wrongFor === message.id),
+    );
+  }
+  const extra = custom.map((action) => `
+    <button type="button" title="${esc(action.label)}" aria-label="${esc(action.label)}" data-action="coach-run" data-action-id="${esc(action.id)}" data-id="${esc(message.id)}" class="rounded px-1 text-sm text-slate-300 hover:bg-white/5">${esc(action.icon || "•")}</button>
+  `);
+  const siblings = message.siblingCount > 1 ? `
+    <span class="mr-1 flex items-center gap-1 text-[11px] text-slate-400">
+      <button type="button" data-action="coach-sibling" data-id="${esc(message.id)}" data-dir="-1" class="px-1 ${message.siblingIndex <= 1 ? "opacity-30" : ""}" aria-label="Previous reply">‹</button>
+      ${message.siblingIndex}/${message.siblingCount}
+      <button type="button" data-action="coach-sibling" data-id="${esc(message.id)}" data-dir="1" class="px-1 ${message.siblingIndex >= message.siblingCount ? "opacity-30" : ""}" aria-label="Next reply">›</button>
+    </span>
+  ` : "";
+  return `<div class="mt-2 flex items-center gap-0.5 overflow-x-auto">${siblings}${buttons.join("")}${extra.join("")}</div>`;
+}
+
+function coachInfoLine(message) {
+  const meta = message.meta || {};
+  const parts = [];
+  if (meta.model) parts.push(meta.model);
+  if (meta.ms) parts.push(`${Math.max(1, Math.round(meta.ms / 100) / 10)}s`);
+  if (meta.tools?.length) parts.push(`Used ${meta.tools.join(", ")}`);
+  return parts.length ? parts.join(" · ") : "No generation details were saved for this reply.";
+}
+
 function coachBubble(message) {
   if (message.kind === "status") {
     return `<p class="text-center text-[11px] text-slate-500">${esc(message.body)}</p>`;
   }
-  const coach = message.kind === "coach" || message.kind === "review";
   const mine = message.kind === "me" || message.kind === "note";
   const tone = message.kind === "review"
     ? "border-amber-800/80 bg-amber-950/30"
@@ -446,66 +568,283 @@ function coachBubble(message) {
       : message.kind === "note"
         ? "border-line bg-ink/40"
         : "border-line bg-ink/70";
-  const align = mine ? "ml-8" : "mr-8";
+  const align = mine ? "ml-6" : "mr-6";
+  const editing = state.coachEdit === message.id;
   return `
     <article class="rounded-xl border px-3 py-2 ${tone} ${align}">
       <div class="flex items-center justify-between gap-2">
         ${message.kind === "me" || message.kind === "prospect"
           ? `<input data-speaker-for="${esc(message.id)}" class="w-28 bg-transparent text-[11px] uppercase tracking-wide text-slate-400 outline-none" value="${esc(message.speaker)}">`
           : `<p class="text-[11px] uppercase tracking-wide text-slate-400">${esc(message.speaker)}${message.kind === "review" ? " · review" : ""}</p>`}
-        ${coach ? `<button type="button" data-action="coach-wrong" data-id="${esc(message.id)}" class="text-[11px] text-rose-300">Wrong</button>` : ""}
       </div>
-      <p class="mt-1 whitespace-pre-wrap text-sm leading-6 text-slate-100">${esc(message.body)}</p>
+      ${editing ? `
+        <form data-edit-form="${esc(message.id)}" class="mt-2">
+          <textarea name="body" rows="4" class="field">${esc(message.body)}</textarea>
+          <div class="mt-2 flex gap-2">
+            <button class="rounded-lg bg-mint px-2 py-1 text-xs font-semibold text-ink">Save</button>
+            <button type="button" data-action="coach-edit-cancel" class="text-xs text-slate-400">Cancel</button>
+          </div>
+        </form>
+      ` : `<p class="mt-1 whitespace-pre-wrap text-sm leading-6 text-slate-100">${esc(message.body)}</p>`}
       ${message.hasAudio ? `<audio class="mt-2 h-8 w-full" controls src="/api/coach/audio/${esc(message.id)}"></audio>` : ""}
       ${(message.corrections || []).map((item) => `<p class="mt-2 text-[11px] text-rose-200">Wrong because: ${esc(item.reason)}</p>`).join("")}
+      ${state.coachInfo === message.id ? `<p class="mt-2 text-[11px] leading-5 text-slate-400">${esc(coachInfoLine(message))}</p>` : ""}
       ${state.wrongFor === message.id ? `
         <form data-wrong-form="${esc(message.id)}" class="mt-2 flex gap-2">
           <input name="reason" class="field" placeholder="What should it have done?">
           <button class="rounded-lg bg-mint px-2 text-xs font-semibold text-ink">Save</button>
         </form>
       ` : ""}
+      ${messageActions(message)}
     </article>
+  `;
+}
+
+function coachStrip() {
+  const actions = (state.coachActions || []).filter((action) => action.enabled && action.placement === "strip");
+  if (!actions.length) return "";
+  return `
+    <div class="flex gap-1 overflow-x-auto border-t border-line px-3 py-2">
+      ${actions.map((action) => `
+        <button type="button" title="${esc(action.label)}" aria-label="${esc(action.label)}" data-action="coach-strip" data-action-id="${esc(action.id)}" class="shrink-0 rounded-full border border-line px-2 py-1 text-[11px] text-slate-300 hover:border-mint hover:text-mint">${esc(action.icon)} ${esc(action.label)}</button>
+      `).join("")}
+    </div>
   `;
 }
 
 function coachPanel(lead) {
   const session = state.coachSession;
   const otherLead = session && lead && session.leadId !== lead.id;
+  const liveElsewhere = captureHandle && state.coachLiveId && session && state.coachLiveId !== session.id;
   return `
     <aside class="flex max-h-[calc(100vh-6.5rem)] flex-col rounded-2xl border border-line bg-panel xl:sticky xl:top-16">
       <div class="border-b border-line px-4 py-3">
         <div class="flex items-center justify-between gap-2">
           <h3 class="text-sm font-semibold text-white">${esc(session?.leadName ? `Coach · ${session.leadName}` : "Coach")}</h3>
           <div class="flex gap-2">
+            ${session ? `<button type="button" data-action="coach-reset" class="text-[11px] text-slate-300">Reset chat</button>` : ""}
             ${session ? `<button type="button" data-action="coach-pause" class="text-[11px] text-mint">${session.paused ? "Resume coach" : "Pause coach"}</button>` : ""}
             ${captureHandle ? `<button type="button" data-action="coach-stop" class="text-[11px] text-slate-400">Stop listening</button>` : ""}
             ${session ? `<button type="button" data-action="coach-hide" class="text-[11px] text-slate-500">Hide</button>` : ""}
           </div>
         </div>
-        <p id="coach-status" class="mt-1 text-[11px] text-slate-400">${esc(state.coachStatus || (session ? "Dial starts listening." : "Dial to start the coach."))}</p>
+        ${session?.branches?.length > 1 ? `
+          <select id="coach-branch" class="field mt-2 text-xs">
+            ${session.branches.map((branch) => `<option value="${esc(branch.id)}" ${branch.id === session.id ? "selected" : ""}>${esc(branch.label)}</option>`).join("")}
+          </select>
+        ` : ""}
+        <p id="coach-status" class="mt-1 text-[11px] text-slate-400">${esc(state.coachStatus || coachReadyLine(lead, session))}</p>
+        ${liveElsewhere ? `<p class="mt-1 text-[11px] text-amber-200">The live call is still recording on the original thread.</p>` : ""}
         ${otherLead ? `<p class="mt-1 text-[11px] text-amber-200">Showing ${esc(session.leadName)} while ${esc(lead.name)} is up next.</p>` : ""}
         <p class="mt-1 text-[11px] text-slate-500">${esc(coachPrivacy())}</p>
       </div>
       <div id="coach-log" class="min-h-0 flex-1 space-y-3 overflow-y-auto px-3 py-3">
-        ${session?.messages?.length ? session.messages.map(coachBubble).join("") : `<p class="text-sm text-slate-500">The thread fills in as you talk. After the prospect stops, the coach says what to say next. Typed messages here are to the coach.</p>`}
+        ${session?.messages?.length ? session.messages.map(coachBubble).join("") : `<p class="text-sm text-slate-500">${lead ? "Ask how to open, what to watch for, or how to handle an objection. Dial when you want the coach to listen to the live call." : "The thread fills in as you talk. Typed messages here are to the coach."}</p>`}
         ${session?.reviewStatus === "pending" ? `<p class="text-center text-[11px] text-amber-200">Writing the review…</p>` : ""}
       </div>
+      ${coachStrip()}
       <form id="coach-form" class="flex gap-2 border-t border-line p-3">
-        <input id="coach-input" class="field" placeholder="${session ? "Tell the coach, or say “be more direct”" : "Dial first, then talk to the coach"}" ${session ? "" : "disabled"}>
-        <button class="rounded-lg bg-mint px-3 text-sm font-semibold text-ink" ${session ? "" : "disabled"}>Send</button>
+        <input id="coach-input" class="field" placeholder="${lead || session ? "Prep this call, or say “be more direct”" : "Queue a lead to talk to the coach"}" ${lead || session ? "" : "disabled"}>
+        <button class="rounded-lg bg-mint px-3 text-sm font-semibold text-ink" ${lead || session ? "" : "disabled"}>Send</button>
       </form>
     </aside>
   `;
 }
 
+function coachReadyLine(lead, session) {
+  if (session && captureHandle) return "Listening to the call.";
+  if (session) return "Ready for prep. Dial when you want the coach to listen.";
+  if (lead) return "You can prep before you dial.";
+  return "Queue a lead to talk to the coach.";
+}
+
+let parkedCoach = null;
+
+async function ensureCoachSession(lead) {
+  const current = state.coachSession;
+  if (current && !current.endedAt && lead && current.leadId === lead.id) return current;
+  if (current && !current.endedAt && state.coachPin && (!lead || current.leadId === lead.id)) return current;
+  if (!lead) throw new Error("Queue a lead before talking to the coach.");
+  if (current && current.leadId !== lead.id) {
+    parkedCoach = { session: current, pin: state.coachPin, liveId: state.coachLiveId };
+    state.coachPin = false;
+  }
+  const session = await api("/api/coach/sessions", {
+    method: "POST",
+    body: JSON.stringify({ leadId: lead.id }),
+  });
+  state.coachSession = session;
+  if (!captureHandle) state.coachLiveId = session.id;
+  return session;
+}
+
+function restoreParkedCoach() {
+  if (!parkedCoach) return;
+  state.coachSession = parkedCoach.session;
+  state.coachPin = parkedCoach.pin;
+  state.coachLiveId = captureHandle ? state.coachLiveId : parkedCoach.liveId;
+  parkedCoach = null;
+}
+
+function coachActionById(id) {
+  return (state.coachActions || []).find((action) => action.id === id);
+}
+
+async function applyCoachResult(result) {
+  if (result?.session) state.coachSession = result.session;
+  if (result?.personaUpdated) state.settings = await api("/api/settings");
+  if (result?.notepadUpdated && state.coachSession?.leadId) {
+    await loadRecordNotes(state.coachSession.leadId);
+    const savedLead = await api(`/api/leads/${state.coachSession.leadId}`);
+    if (state.queue?.lead?.id === savedLead.id) state.queue.lead = savedLead;
+    if (state.detail?.id === savedLead.id) state.detail = savedLead;
+    showToast("Note added");
+    if (recordTab(state.view === "leads" ? "leads" : "dial") === "notes") render();
+  }
+}
+
+async function steerCoach(action) {
+  const lead = recordLead();
+  const session = await ensureCoachSession(lead);
+  state.coachSession = await api(`/api/coach/sessions/${session.id}/steer`, {
+    method: "POST",
+    body: JSON.stringify({ text: action.payload?.text || action.label, label: action.label }),
+  });
+  state.coachStatus = `Noted: ${action.label}.`;
+  paintCoach();
+}
+
+async function runCoachAction(action, messageId) {
+  if (!action || state.coachBusy) return;
+  if (action.effect === "disposition") {
+    await onDisposition(action.payload?.outcome, recordLead()?.id);
+    return;
+  }
+  if (action.effect === "steer") {
+    await steerCoach(action);
+    return;
+  }
+  const lead = recordLead();
+  const session = await ensureCoachSession(lead);
+  if (action.effect === "prompt") {
+    state.coachBusy = true;
+    state.coachStreaming = true;
+    coachLiveText = "";
+    state.coachStatus = "Writing…";
+    try {
+      const streamed = await consumeCoachStream(`/api/coach/actions/${action.id}/run`, { sessionId: session.id, messageId }, coachStreamHandlers());
+      await applyCoachResult(streamed.session ? streamed : { session: streamed.session });
+      if (streamed.session) state.coachSession = streamed.session;
+    } finally {
+      state.coachBusy = false;
+      state.coachStreaming = false;
+      coachLiveText = "";
+      paintCoach();
+    }
+    return;
+  }
+  const result = await api(`/api/coach/actions/${action.id}/run`, {
+    method: "POST",
+    body: JSON.stringify({ sessionId: session.id, messageId }),
+  });
+  if (result.disposition) {
+    await onDisposition(result.disposition, recordLead()?.id);
+    return;
+  }
+  await applyCoachResult(result);
+  paintCoach();
+}
+
+async function streamCoachMessage(path, body) {
+  state.coachBusy = true;
+  state.coachStreaming = true;
+  coachLiveText = "";
+  state.coachStatus = "Writing…";
+  try {
+    const streamed = await consumeCoachStream(path, body, coachStreamHandlers());
+    if (streamed.session) state.coachSession = streamed.session;
+  } finally {
+    state.coachBusy = false;
+    state.coachStreaming = false;
+    coachLiveText = "";
+    state.coachEdit = null;
+    paintCoach();
+  }
+}
+
+let coachLiveText = "";
+
+function coachStreamHandlers() {
+  return {
+    onStart() {
+      state.coachStreaming = true;
+      state.coachStatus = "Writing…";
+      const status = document.getElementById("coach-status");
+      if (status) status.textContent = "Writing…";
+      showCoachDraft();
+    },
+    onDelta(text) {
+      coachLiveText += text;
+      if (state.coachStatus === "Looking that up…") {
+        state.coachStatus = "Writing…";
+        const status = document.getElementById("coach-status");
+        if (status) status.textContent = "Writing…";
+      }
+      showCoachDraft();
+    },
+    onReset() {
+      coachLiveText = "";
+      showCoachDraft();
+    },
+    onStatus(body) {
+      state.coachStatus = body;
+      const status = document.getElementById("coach-status");
+      if (status) status.textContent = body;
+    },
+  };
+}
+
+function showCoachDraft() {
+  const log = document.getElementById("coach-log");
+  if (!log) return;
+  log.querySelector(":scope > p.text-sm.text-slate-500")?.remove();
+  let live = document.getElementById("coach-live");
+  if (!live) {
+    live = document.createElement("article");
+    live.id = "coach-live";
+    live.className = "mr-8 rounded-xl border border-emerald-900 bg-emerald-950/40 px-3 py-2";
+    log.appendChild(live);
+  }
+  const name = state.settings.coachName || "Coach";
+  live.innerHTML = `<p class="text-[11px] uppercase tracking-wide text-slate-400">${esc(name)}</p><p class="mt-1 whitespace-pre-wrap text-sm leading-6 text-slate-100">${esc(coachLiveText)}<span class="animate-pulse text-mint">▍</span></p>`;
+  log.scrollTop = log.scrollHeight;
+}
+
+function showOwnCoachNote(text) {
+  const log = document.getElementById("coach-log");
+  if (!log) return;
+  log.querySelector(":scope > p.text-sm.text-slate-500")?.remove();
+  const article = document.createElement("article");
+  article.className = "ml-8 rounded-xl border border-line bg-ink/40 px-3 py-2";
+  article.innerHTML = `<p class="text-[11px] uppercase tracking-wide text-slate-400">Me</p><p class="mt-1 whitespace-pre-wrap text-sm leading-6 text-slate-100">${esc(text)}</p>`;
+  log.appendChild(article);
+  log.scrollTop = log.scrollHeight;
+}
+
 function paintCoach() {
   const aside = document.getElementById("coach-log");
-  if (!aside || state.view !== "dial") return;
+  if (!aside || (state.view !== "dial" && !(state.view === "leads" && state.leadModal))) return;
+  if (state.coachStreaming && document.getElementById("coach-live")) {
+    const status = document.getElementById("coach-status");
+    if (status && state.coachStatus) status.textContent = state.coachStatus;
+    aside.scrollTop = aside.scrollHeight;
+    return;
+  }
   const panel = aside.closest("aside");
   if (!panel) return;
   const draft = document.getElementById("coach-input")?.value || "";
   const fresh = document.createElement("template");
-  fresh.innerHTML = coachPanel(state.queue.lead);
+  fresh.innerHTML = coachPanel(recordLead());
   panel.replaceWith(fresh.content.firstElementChild);
   const input = document.getElementById("coach-input");
   if (input && draft) input.value = draft;
@@ -552,6 +891,52 @@ function renderCoachPage() {
         </div>
       </form>
     </div>
+    <section class="mt-4 rounded-2xl border border-line bg-panel p-4">
+      <h2 class="text-sm font-semibold text-white">Message actions</h2>
+      <p class="mt-1 text-xs text-slate-400">Strip actions sit above the composer. Message actions join the icon row. A file in <span class="font-mono">coach-actions</span> can export a default action with an id, label, icon, placement, kinds, and run function.</p>
+      <div class="mt-3 flex flex-wrap gap-2">
+        ${(state.coachActions || []).map((action) => `
+          <span class="inline-flex items-center gap-2 rounded-full border border-line px-2 py-1 text-[11px] text-slate-300">
+            ${esc(action.icon)} ${esc(action.label)}
+            <span class="text-slate-500">${esc(action.placement)}${action.shortcut ? ` · ${esc(action.shortcut)}` : ""}</span>
+            ${action.source === "plugin" ? `<span class="text-slate-500">plugin</span>` : action.builtin ? `<button type="button" data-action="toggle-coach-action" data-id="${esc(action.id)}" data-enabled="${action.enabled ? "0" : "1"}" class="text-mint">${action.enabled ? "Hide" : "Show"}</button>` : `<button type="button" data-action="delete-coach-action" data-id="${esc(action.id)}" class="text-rose-300">Delete</button>`}
+          </span>
+        `).join("")}
+      </div>
+      <form id="coach-action-form" class="mt-4 grid gap-3 md:grid-cols-2">
+        <label class="text-xs text-slate-400">Name<input name="label" class="field mt-1" required></label>
+        <label class="text-xs text-slate-400">Icon<input name="icon" class="field mt-1" value="•" maxlength="8"></label>
+        <label class="text-xs text-slate-400">Where it shows
+          <select name="placement" class="field mt-1">
+            <option value="strip">Above the composer</option>
+            <option value="message">On the message row</option>
+          </select>
+        </label>
+        <label class="text-xs text-slate-400">What it does
+          <select name="effect" class="field mt-1">
+            <option value="steer">Steer the next reply</option>
+            <option value="prompt">Run a prompt in the thread</option>
+            <option value="notepad">Add to the notepad</option>
+            <option value="memory">Save to coach memory</option>
+            <option value="disposition">Log a disposition</option>
+          </select>
+        </label>
+        <label class="text-xs text-slate-400 md:col-span-2">Shortcut<input name="shortcut" class="field mt-1" placeholder="6, 0, or NumpadAdd"></label>
+        <fieldset class="text-xs text-slate-400 md:col-span-2">
+          <legend>Show on these messages</legend>
+          <div class="mt-1 flex flex-wrap gap-3">
+            ${["coach", "note", "me", "prospect"].map((kind) => `<label><input type="checkbox" name="kinds" value="${kind}"> ${kind}</label>`).join("")}
+          </div>
+        </fieldset>
+        <label class="text-xs text-slate-400">Disposition
+          <select name="outcome" class="field mt-1">
+            ${OUTCOMES.map((outcome) => `<option value="${outcome.id}">${esc(outcome.label)}</option>`).join("")}
+          </select>
+        </label>
+        <label class="text-xs text-slate-400 md:col-span-2">Instruction or prompt<textarea name="text" rows="3" class="field mt-1" placeholder="Use {{message}} for the line this was clicked on."></textarea></label>
+        <button class="w-fit rounded-lg bg-mint px-3 py-2 text-sm font-semibold text-ink">Add action</button>
+      </form>
+    </section>
   `;
 }
 
@@ -576,108 +961,271 @@ async function syncCoachToQueue() {
   }
 }
 
-function renderFocus(lead, campaign) {
-  const url = voiceUrl(lead.phone);
+const RECORD_TABS = [
+  ["chat", "Chat"],
+  ["profile", "Profile"],
+  ["notes", "Notes"],
+  ["disposition", "Disposition"],
+  ["history", "History"],
+];
+
+function recordLead() {
+  if (state.view === "leads" && state.leadModal && state.detail) return state.detail;
+  return state.queue?.lead || null;
+}
+
+function recordTab(scope) {
+  return scope === "leads" ? state.leadsTab : state.dialTab;
+}
+
+function askConfirm(message, actions) {
+  const root = document.getElementById("confirm");
+  const text = document.getElementById("confirm-text");
+  const box = document.getElementById("confirm-actions");
+  text.textContent = message;
+  box.innerHTML = actions.map((action) => `<button type="button" data-confirm="${esc(action.id)}" class="rounded-lg px-3 py-2 text-sm ${action.id === "save" ? "bg-mint font-semibold text-ink" : "border border-line text-slate-200"}">${esc(action.label)}</button>`).join("");
+  root.classList.remove("hidden");
+  root.classList.add("flex");
+  return new Promise((resolve) => {
+    box.onclick = (event) => {
+      const button = event.target.closest("[data-confirm]");
+      if (!button) return;
+      root.classList.add("hidden");
+      root.classList.remove("flex");
+      box.onclick = null;
+      resolve(button.dataset.confirm);
+    };
+  });
+}
+
+async function loadRecordNotes(leadId) {
+  if (!leadId) {
+    state.recordNotes = [];
+    return;
+  }
+  state.recordNotes = await api(`/api/leads/${leadId}/notes`);
+}
+
+function recordTabBar(scope) {
+  const current = recordTab(scope);
+  return `
+    <div class="flex gap-1 overflow-x-auto border-b border-line px-2">
+      ${RECORD_TABS.map(([id, label]) => `
+        <button type="button" data-action="record-tab" data-scope="${scope}" data-tab="${id}" class="shrink-0 border-b-2 px-3 py-2 text-sm ${current === id ? "border-mint text-white" : "border-transparent text-slate-400"}">${label}</button>
+      `).join("")}
+    </div>
+  `;
+}
+
+function scriptColumn(lead) {
   const script = lead.script;
   const sections = (script?.sections?.length ? script.sections : [{ label: "Opening", text: script?.body || "" }]).filter((section) => section.text);
-  const follow = (campaign?.cadence?.steps || []).find((step) => step.type === "followup");
+  if (!sections.length && !script?.objections?.length) return "";
   return `
-    <section class="grid items-start gap-4 xl:grid-cols-[minmax(0,1fr)_400px]">
-      <div class="space-y-4">
-        <article class="rounded-2xl border border-line bg-panel p-5">
-          <div class="flex flex-wrap items-start justify-between gap-4">
-            <div>
-              <p class="text-xs uppercase tracking-wide text-slate-500">${esc(lead.stage)} · ${esc(lead.campaignName || "No campaign")}</p>
-              <h2 class="mt-1 text-3xl font-semibold text-white">${esc(lead.name)}</h2>
-              <p class="mt-1 text-sm text-slate-400">${esc([lead.title, lead.company].filter(Boolean).join(" · ") || "No company")}</p>
-              <p class="mt-2 text-xs text-emerald-200/80">${lead.timezone ? `Local time ${esc(localTime(lead.timezone))} · ${esc(lead.timezone)}` : `Your time ${esc(localTime())}`}</p>
-            </div>
-            <div class="text-right">
-              <p class="font-mono text-xl text-mint">${esc(formatPhone(lead.phone))}</p>
-              <p id="attempt-count" class="mt-1 text-xs text-slate-500">Attempts ${lead.attempts}${lead.lastCalledAt ? ` · last ${esc(formatWhen(lead.lastCalledAt))}` : ""}</p>
-              <p class="mt-1 text-xs text-slate-500">Score ${lead.score.value} ${esc(lead.score.band)}</p>
-            </div>
-          </div>
-          <a id="dial-link" data-action="dial" href="${esc(url)}" target="_blank" rel="noopener noreferrer" class="mt-5 flex items-center justify-center rounded-xl bg-mint px-4 py-4 text-center text-base font-semibold text-ink ${state.paused ? "pointer-events-none opacity-40" : "hover:brightness-110"}">
-            Open Google Voice &amp; Dial (${esc(formatPhone(lead.phone))})
-          </a>
-          <p class="mt-2 text-center font-mono text-[11px] text-slate-500">Space or Enter to dial · keys 1–5 log the outcome · N skips</p>
-          <div class="mt-3 flex flex-wrap items-center justify-center gap-2">
-            ${timerControls(lead.id)}
-            <button type="button" data-action="reset-attempts" data-id="${esc(lead.id)}" class="rounded-lg border border-line px-2 py-1 text-xs">Reset attempts</button>
-            <button type="button" data-action="archive-lead" data-id="${esc(lead.id)}" class="rounded-lg border border-line px-2 py-1 text-xs">Archive</button>
-          </div>
-        </article>
-        <article class="rounded-2xl border border-line bg-panel p-4">
-          <div class="mb-3 flex items-center justify-between">
-            <h3 class="text-sm font-semibold text-white">Disposition</h3>
-            <span class="text-[11px] text-slate-500">Auto-advance ${campaign?.cadence?.autoAdvance === false ? "off" : "on"}</span>
-          </div>
-          <div class="grid gap-2 md:grid-cols-5">
-            ${OUTCOMES.map((outcome) => `
-              <button type="button" data-action="disposition" data-outcome="${outcome.id}" class="rounded-xl border bg-ink/40 px-3 py-3 text-left ${outcome.tone}">
-                <span class="font-mono text-[10px] text-slate-500">${outcome.key}</span>
-                <span class="mt-1 block text-sm font-semibold text-white">${outcome.label}</span>
-                <span class="mt-1 block text-[11px] text-slate-400">${outcome.hint}</span>
+    <article class="max-h-[calc(100vh-18rem)] overflow-y-auto rounded-2xl border border-line bg-ink/40 p-4">
+      <div class="flex items-center justify-between">
+        <h3 class="text-sm font-semibold text-white">Script</h3>
+        <span class="text-[11px] text-slate-500">${esc(script?.name || "")}</span>
+      </div>
+      ${sections.map((section) => `
+        <div class="mt-4">
+          <p class="text-[10px] uppercase tracking-wide text-emerald-300/80">${esc(section.label || "Section")}</p>
+          <p class="mt-1 whitespace-pre-wrap text-sm leading-6 text-slate-200">${esc(fillTokens(section.text, lead))}</p>
+        </div>
+      `).join("")}
+      ${script?.objections?.length ? `
+        <div class="mt-5 border-t border-line pt-4">
+          <p class="text-[10px] uppercase tracking-wide text-slate-500">Objections</p>
+          <div class="mt-2 space-y-2">
+            ${script.objections.map((item) => `
+              <button type="button" data-action="objection" data-label="${esc(item.label)}" class="block w-full rounded-lg border border-line px-3 py-2 text-left text-sm hover:border-mint ${state.objectionLabel === item.label ? "border-mint bg-emerald-950/30" : ""}">
+                <span class="text-slate-200">${esc(item.label)}</span>
+                ${state.objectionLabel === item.label ? `<span class="mt-1 block text-xs leading-5 text-emerald-100">${esc(fillTokens(item.response, lead))}</span>` : ""}
               </button>
             `).join("")}
           </div>
-        </article>
-        <article class="rounded-2xl border border-line bg-panel p-4">
-          <div class="mb-2 flex items-center justify-between text-sm">
-            <h3 class="font-semibold text-white">Live notepad</h3>
-            <span id="save-label" class="text-xs text-slate-500">${state.saveState === "saving" ? "Saving…" : state.saveState === "saved" ? "Saved" : "Autosave"}</span>
-          </div>
-          <div class="mb-2 flex flex-wrap gap-2">
-            ${TAGS.map((tag) => `<button type="button" data-action="tag" data-tag="${esc(tag)}" class="rounded-full border border-line px-2 py-1 text-[11px] text-slate-300 hover:border-mint hover:text-mint">+ ${esc(tag)}</button>`).join("")}
-          </div>
-          <textarea id="notes" rows="4" class="field" placeholder="What they said, and the next step.">${esc(state.draftNotes)}</textarea>
-          ${follow ? `<button type="button" data-action="copy-followup" class="mt-3 text-xs text-mint hover:underline">Copy follow-up draft</button>` : ""}
-        </article>
-        <article class="rounded-2xl border border-line bg-panel p-4">
-          <h3 class="text-sm font-semibold text-white">Previous touchpoints</h3>
-          <div class="mt-3 space-y-2">
-            ${(lead.calls || []).length ? lead.calls.map((call) => `
-              <div class="rounded-lg bg-ink/50 px-3 py-2 text-sm">
-                <div class="flex items-start justify-between gap-2">
-                  <div>
-                    <span class="text-mint">${esc(STATUS_LABELS[call.outcome] || call.outcome)}</span>
-                    <span class="text-slate-500"> · ${formatDuration(call.durationSeconds)} · ${esc(formatWhen(call.endedAt))}</span>
-                  </div>
-                  <button type="button" data-action="open-coach-call" data-id="${esc(call.id)}" class="text-[11px] text-mint">Thread</button>
-                </div>
-                ${call.notes ? `<p class="mt-1 text-slate-300">${esc(call.notes)}</p>` : ""}
-              </div>
-            `).join("") : `<p class="text-sm text-slate-500">No calls logged for this lead.</p>`}
-          </div>
-        </article>
-        <article class="rounded-2xl border border-line bg-panel p-4">
-          <div class="flex items-center justify-between">
-            <h3 class="text-sm font-semibold text-white">Script</h3>
-            <span class="text-[11px] text-slate-500">${esc(script?.name || "No script")}</span>
-          </div>
-          ${sections.length ? sections.map((section) => `
-            <div class="mt-4">
-              <p class="text-[10px] uppercase tracking-wide text-emerald-300/80">${esc(section.label || "Section")}</p>
-              <p class="mt-1 whitespace-pre-wrap text-sm leading-6 text-slate-200">${esc(fillTokens(section.text, lead))}</p>
-            </div>
-          `).join("") : `<p class="mt-4 text-sm text-slate-400">Attach a script to this campaign to read it here. Use {{first_name}} and {{company}}.</p>`}
-          ${script?.objections?.length ? `
-            <div class="mt-5 border-t border-line pt-4">
-              <p class="text-[10px] uppercase tracking-wide text-slate-500">Objections</p>
-              <div class="mt-2 space-y-2">
-                ${script.objections.map((item) => `
-                  <button type="button" data-action="objection" data-label="${esc(item.label)}" class="block w-full rounded-lg border border-line px-3 py-2 text-left text-sm hover:border-mint ${state.objectionLabel === item.label ? "border-mint bg-emerald-950/30" : ""}">
-                    <span class="text-slate-200">${esc(item.label)}</span>
-                    ${state.objectionLabel === item.label ? `<span class="mt-1 block text-xs leading-5 text-emerald-100">${esc(fillTokens(item.response, lead))}</span>` : ""}
-                  </button>
-                `).join("")}
-              </div>
-            </div>
-          ` : ""}
-        </article>
+        </div>
+      ` : ""}
+    </article>
+  `;
+}
+
+function profileValues(lead) {
+  const draft = state.profileDraft;
+  if (state.profileDirty && draft?.id === lead.id) return draft;
+  return {
+    id: lead.id,
+    name: lead.name || "",
+    title: lead.title || "",
+    company: lead.company || "",
+    phone: formatPhone(lead.phone),
+    email: lead.email || "",
+    timezone: lead.timezone || "",
+    campaignId: lead.campaignId || "",
+    status: lead.status || "new",
+  };
+}
+
+function profilePanel(lead) {
+  const values = profileValues(lead);
+  return `
+    <form id="profile-form" data-lead="${esc(lead.id)}" class="grid gap-3 sm:grid-cols-2">
+      <label class="text-xs text-slate-400">Name<input name="name" class="field mt-1" value="${esc(values.name)}"></label>
+      <label class="text-xs text-slate-400">Title<input name="title" class="field mt-1" value="${esc(values.title)}"></label>
+      <label class="text-xs text-slate-400">Company<input name="company" class="field mt-1" value="${esc(values.company)}"></label>
+      <label class="text-xs text-slate-400">Phone<input name="phone" class="field mt-1" value="${esc(values.phone)}"></label>
+      <label class="text-xs text-slate-400">Email<input name="email" class="field mt-1" value="${esc(values.email)}"></label>
+      <label class="text-xs text-slate-400">Timezone<input name="timezone" class="field mt-1" value="${esc(values.timezone)}" placeholder="America/New_York"></label>
+      <label class="text-xs text-slate-400">Campaign
+        <select name="campaignId" class="field mt-1">
+          <option value="">No campaign</option>
+          ${state.campaigns.map((campaign) => `<option value="${esc(campaign.id)}" ${campaign.id === values.campaignId ? "selected" : ""}>${esc(campaign.name)}</option>`).join("")}
+        </select>
+      </label>
+      <label class="text-xs text-slate-400">Status
+        <select name="status" class="field mt-1">
+          ${Object.entries(STATUS_LABELS).map(([id, label]) => `<option value="${id}" ${values.status === id ? "selected" : ""}>${esc(label)}</option>`).join("")}
+          ${values.status && !STATUS_LABELS[values.status] ? `<option value="${esc(values.status)}" selected>${esc(values.status)}</option>` : ""}
+        </select>
+      </label>
+      <div class="text-sm text-slate-300"><p class="text-[11px] uppercase text-slate-500">Stage</p><p class="mt-1">${esc(lead.stage)}</p></div>
+      <div class="text-sm text-slate-300"><p class="text-[11px] uppercase text-slate-500">Score</p><p class="mt-1">${lead.score.value} · ${esc(lead.score.band)}</p></div>
+      <div class="text-sm text-slate-300"><p class="text-[11px] uppercase text-slate-500">Attempts</p><p class="mt-1">${lead.attempts}</p></div>
+      <div class="text-sm text-slate-300"><p class="text-[11px] uppercase text-slate-500">Queue</p><p class="mt-1">${lead.inQueue ? "In the queue" : "Not in the queue"}</p></div>
+      <div class="sm:col-span-2">
+        <button class="rounded-lg bg-mint px-3 py-2 text-sm font-semibold text-ink">Save profile</button>
       </div>
-      ${coachPanel(lead)}
+    </form>
+  `;
+}
+
+function notesPanel(lead) {
+  const notes = state.recordNotes || [];
+  return `
+    <form id="note-form" data-lead="${esc(lead.id)}" class="rounded-xl border border-line bg-ink/40 p-3">
+      <textarea name="body" rows="3" class="field" placeholder="Write a note about this lead.">${esc(state.noteDraft || "")}</textarea>
+      <div class="mt-2 flex flex-wrap gap-2">
+        ${TAGS.map((tag) => `
+          <button type="button" data-action="note-tag" data-tag="${esc(tag)}" class="rounded-full border px-2 py-1 text-[11px] ${state.noteTags.includes(tag) ? "border-mint text-mint" : "border-line text-slate-300"}">${esc(tag)}</button>
+        `).join("")}
+      </div>
+      <button class="mt-3 rounded-lg bg-mint px-3 py-2 text-sm font-semibold text-ink">Add note</button>
+    </form>
+    <div class="mt-4 space-y-3">
+      ${notes.length ? notes.map((note) => `
+        <article class="rounded-xl border border-line bg-ink/40 px-3 py-2">
+          <div class="flex flex-wrap items-center gap-2 text-[11px] uppercase tracking-wide text-slate-500">
+            <span>${esc(formatWhen(note.createdAt))}</span>
+            <span>${esc(note.author === "me" ? "You" : note.author === "coach" ? "Coach" : "System")}</span>
+            ${note.callOutcome ? `<span>${esc(STATUS_LABELS[note.callOutcome] || note.callOutcome)}</span>` : ""}
+            ${(note.tags || []).map((tag) => `<span class="rounded-full border border-line px-2 py-0.5 text-slate-300">${esc(tag)}</span>`).join("")}
+          </div>
+          ${state.noteEdit === note.id ? `
+            <form data-note-edit="${esc(note.id)}" class="mt-2">
+              <textarea name="body" rows="3" class="field">${esc(note.body)}</textarea>
+              <div class="mt-2 flex gap-2">
+                <button class="rounded-lg bg-mint px-2 py-1 text-xs font-semibold text-ink">Save</button>
+                <button type="button" data-action="note-edit-cancel" class="text-xs text-slate-400">Cancel</button>
+              </div>
+            </form>
+          ` : `<p class="mt-2 whitespace-pre-wrap text-sm text-slate-100">${esc(note.body)}</p>`}
+          <div class="mt-2 flex gap-3 text-[11px]">
+            <button type="button" data-action="note-edit" data-id="${esc(note.id)}" class="text-slate-400">Edit</button>
+            <button type="button" data-action="note-delete" data-id="${esc(note.id)}" class="text-rose-300">Delete</button>
+          </div>
+        </article>
+      `).join("") : `<p class="text-sm text-slate-500">No notes yet.</p>`}
+    </div>
+  `;
+}
+
+function dispositionPanel(lead, campaign) {
+  return `
+    <p class="text-[11px] text-slate-500">Auto-advance ${campaign?.cadence?.autoAdvance === false ? "off" : "on"} · keys 1–5 still log the outcome on the dialer</p>
+    <div class="mt-3 grid gap-2 sm:grid-cols-2 xl:grid-cols-5">
+      ${OUTCOMES.map((outcome) => `
+        <button type="button" data-action="disposition" data-outcome="${outcome.id}" data-lead="${esc(lead.id)}" class="rounded-xl border bg-ink/40 px-3 py-3 text-left ${outcome.tone}">
+          <span class="font-mono text-[10px] text-slate-500">${outcome.key}</span>
+          <span class="mt-1 block text-sm font-semibold text-white">${outcome.label}</span>
+          <span class="mt-1 block text-[11px] text-slate-400">${outcome.hint}</span>
+        </button>
+      `).join("")}
+    </div>
+  `;
+}
+
+function historyPanel(lead) {
+  const calls = lead.calls || [];
+  if (!calls.length) return `<p class="text-sm text-slate-500">No calls logged for this lead.</p>`;
+  return `
+    <div class="space-y-2">
+      ${calls.map((call) => `
+        <div class="rounded-lg bg-ink/50 px-3 py-2 text-sm">
+          <div class="flex items-start justify-between gap-2">
+            <div>
+              <span class="text-mint">${esc(STATUS_LABELS[call.outcome] || call.outcome)}</span>
+              <span class="text-slate-500"> · ${formatDuration(call.durationSeconds)} · ${esc(formatWhen(call.endedAt))}</span>
+            </div>
+            <button type="button" data-action="open-coach-call" data-id="${esc(call.id)}" class="text-[11px] text-mint">Thread</button>
+          </div>
+          ${call.notes ? `<p class="mt-1 text-slate-300">${esc(call.notes)}</p>` : ""}
+        </div>
+      `).join("")}
+    </div>
+  `;
+}
+
+function recordPanel(lead, campaign, scope) {
+  const tab = recordTab(scope);
+  if (tab === "chat") {
+    const script = scriptColumn(lead);
+    return `
+      <div class="${script ? "grid items-start gap-4 xl:grid-cols-[minmax(240px,1fr)_minmax(0,2fr)]" : ""}">
+        ${script}
+        ${coachPanel(lead)}
+      </div>
+    `;
+  }
+  if (tab === "profile") return profilePanel(lead);
+  if (tab === "notes") return notesPanel(lead);
+  if (tab === "disposition") return dispositionPanel(lead, campaign);
+  return historyPanel(lead);
+}
+
+function recordHeader(lead, { dialAction = "dial" } = {}) {
+  const url = voiceUrl(lead.phone);
+  return `
+    <div class="flex flex-wrap items-start justify-between gap-4">
+      <div>
+        <p class="text-xs uppercase tracking-wide text-slate-500">${esc(lead.stage)} · ${esc(lead.campaignName || "No campaign")}</p>
+        <h2 class="mt-1 text-3xl font-semibold text-white">${esc(lead.name)}</h2>
+        <p class="mt-1 text-sm text-slate-400">${esc([lead.title, lead.company].filter(Boolean).join(" · ") || "No company")}</p>
+        <p class="mt-2 text-xs text-emerald-200/80">${lead.timezone ? `Local time ${esc(localTime(lead.timezone))} · ${esc(lead.timezone)}` : `Your time ${esc(localTime())}`}</p>
+      </div>
+      <div class="text-right">
+        <p class="font-mono text-xl text-mint">${esc(formatPhone(lead.phone))}</p>
+        <p id="attempt-count" class="mt-1 text-xs text-slate-500">Attempts ${lead.attempts}${lead.lastCalledAt ? ` · last ${esc(formatWhen(lead.lastCalledAt))}` : ""}</p>
+        <p class="mt-1 text-xs text-slate-500">Score ${lead.score.value} ${esc(lead.score.band)}</p>
+      </div>
+    </div>
+    <a id="${dialAction === "dial" ? "dial-link" : ""}" data-action="${dialAction}" data-id="${esc(lead.id)}" href="${esc(url)}" target="_blank" rel="noopener noreferrer" class="mt-5 flex items-center justify-center rounded-xl bg-mint px-4 py-4 text-center text-base font-semibold text-ink ${state.paused && dialAction === "dial" ? "pointer-events-none opacity-40" : "hover:brightness-110"}">
+      Open Google Voice &amp; Dial (${esc(formatPhone(lead.phone))})
+    </a>
+    <p class="mt-2 text-center font-mono text-[11px] text-slate-500">Space or Enter to dial · 1–5 dispositions · 6–0 and numpad steer the coach · N skips</p>
+    <div class="mt-3 flex flex-wrap items-center justify-center gap-2">
+      ${timerControls(lead.id)}
+      <button type="button" data-action="reset-attempts" data-id="${esc(lead.id)}" class="rounded-lg border border-line px-2 py-1 text-xs">Reset attempts</button>
+      <button type="button" data-action="archive-lead" data-id="${esc(lead.id)}" data-archived="${lead.archived ? "1" : "0"}" class="rounded-lg border border-line px-2 py-1 text-xs">${lead.archived ? "Restore" : "Archive"}</button>
+    </div>
+  `;
+}
+
+function renderFocus(lead, campaign) {
+  return `
+    <section class="rounded-2xl border border-line bg-panel">
+      <div class="p-5">${recordHeader(lead)}</div>
+      ${recordTabBar("dial")}
+      <div class="p-4">${recordPanel(lead, campaign, "dial")}</div>
     </section>
   `;
 }
@@ -695,8 +1243,25 @@ function statusCounts() {
   ];
 }
 
+function leadRecordModal() {
+  if (!state.leadModal || !state.detail) return "";
+  const lead = state.detail;
+  const campaign = campaignById(lead.campaignId);
+  return `
+    <div class="fixed inset-0 z-40 flex items-start justify-center overflow-y-auto bg-black/70 px-4 py-8">
+      <section class="my-auto w-full max-w-5xl rounded-2xl border border-line bg-panel">
+        <div class="flex justify-end px-5 pt-4">
+          <button type="button" data-action="close-lead" class="rounded-lg border border-line px-3 py-1 text-sm text-slate-200">Close</button>
+        </div>
+        <div class="px-5 pb-2">${recordHeader(lead, { dialAction: "dial-row" })}</div>
+        ${recordTabBar("leads")}
+        <div class="p-4">${recordPanel(lead, campaign, "leads")}</div>
+      </section>
+    </div>
+  `;
+}
+
 function renderLeads() {
-  const detail = state.detail;
   return `
     <section class="mb-4 flex flex-wrap items-center justify-between gap-3">
       <div>
@@ -750,46 +1315,7 @@ function renderLeads() {
         </tbody>
       </table>
     </div>
-    ${detail ? `
-      <article class="mt-4 grid gap-4 rounded-2xl border border-line bg-panel p-5 lg:grid-cols-[220px_minmax(0,1fr)]">
-        <div>
-          <h2 class="text-xl font-semibold text-white">${esc(detail.name)}</h2>
-          <p class="text-sm text-slate-400">${esc(detail.title || detail.company || "")}</p>
-          <p class="mt-3 font-mono text-mint">${esc(formatPhone(detail.phone))}</p>
-          <a data-action="dial-row" data-id="${esc(detail.id)}" href="${esc(voiceUrl(detail.phone))}" target="_blank" rel="noopener" class="mt-4 inline-flex rounded-lg bg-mint px-3 py-2 text-sm font-semibold text-ink">Dial now</a>
-          ${timerControls(detail.id)}
-        </div>
-        <div>
-          <div class="grid gap-3 text-sm sm:grid-cols-3">
-            <div><p class="text-[11px] uppercase text-slate-500">Company</p><p>${esc(detail.company || "—")}</p></div>
-            <div><p class="text-[11px] uppercase text-slate-500">Score</p><p>${detail.score.value} / 100 · ${esc(detail.score.band)}</p></div>
-            <div><p class="text-[11px] uppercase text-slate-500">Campaign</p><p>${esc(detail.campaignName || "—")}</p></div>
-          </div>
-          <p class="mt-4 whitespace-pre-wrap text-sm text-slate-300">${esc(detail.notes || "No notes yet.")}</p>
-          <div class="mt-4 flex flex-wrap gap-2">
-            <button type="button" data-action="edit-lead" data-id="${esc(detail.id)}" class="rounded-lg border border-line px-3 py-1.5 text-xs">Edit</button>
-            <button type="button" data-action="reset-attempts" data-id="${esc(detail.id)}" class="rounded-lg border border-line px-3 py-1.5 text-xs">Reset attempts</button>
-            <button type="button" data-action="archive-lead" data-id="${esc(detail.id)}" data-archived="${detail.archived ? "1" : "0"}" class="rounded-lg border border-line px-3 py-1.5 text-xs">${detail.archived ? "Restore" : "Archive"}</button>
-            ${detail.status === "dnc" || detail.archived ? "" : `<button type="button" data-action="requeue" data-id="${esc(detail.id)}" class="rounded-lg border border-line px-3 py-1.5 text-xs">Re-queue</button>`}
-            <button type="button" data-action="delete-lead" data-id="${esc(detail.id)}" data-name="${esc(detail.name)}" class="rounded-lg border border-rose-900 px-3 py-1.5 text-xs text-rose-200">Delete</button>
-          </div>
-          <div class="mt-4 space-y-2">
-            ${(detail.calls || []).slice(0, 4).map((call) => `
-              <div class="rounded-lg bg-ink/50 px-3 py-2 text-sm">
-                <div class="flex items-start justify-between gap-2">
-                  <div>
-                    <span class="text-mint">${esc(STATUS_LABELS[call.outcome] || call.outcome)}</span>
-                    <span class="text-slate-500"> · ${formatDuration(call.durationSeconds)} · ${esc(formatWhen(call.endedAt))}</span>
-                  </div>
-                  <button type="button" data-action="open-coach-call" data-id="${esc(call.id)}" class="text-[11px] text-mint">Thread</button>
-                </div>
-                ${call.notes ? `<p class="mt-1 text-slate-300">${esc(call.notes)}</p>` : ""}
-              </div>
-            `).join("") || `<p class="text-xs text-slate-500">No calls logged.</p>`}
-          </div>
-        </div>
-      </article>
-    ` : ""}
+    ${leadRecordModal()}
   `;
 }
 
@@ -1436,8 +1962,8 @@ async function sendClip(clip) {
   while (!state.coachSession && Date.now() - started < 8000) {
     await new Promise((resolve) => setTimeout(resolve, 40));
   }
-  if (!state.coachSession || state.coachSession.endedAt) return;
-  const sessionId = state.coachSession.id;
+  if (!state.coachLiveId && (!state.coachSession || state.coachSession.endedAt)) return;
+  const sessionId = state.coachLiveId || state.coachSession.id;
   const listen = await import("/listen.js");
   let text = "";
   if ((state.settings.sttMode || "local") !== "remote") {
@@ -1448,13 +1974,17 @@ async function sendClip(clip) {
   }
   const audio = listen.resample(clip.samples, clip.sampleRate, 16000);
   const audioBase64 = listen.bytesToBase64(listen.encodeWav(audio, 16000));
-  const updated = await api(`/api/coach/sessions/${sessionId}/utterances`, {
-    method: "POST",
-    body: JSON.stringify({ speaker: clip.speaker, text, audioBase64 }),
-  });
-  if (state.coachSession?.id === sessionId) {
-    state.coachSession = updated;
-    state.coachStatus = updated.paused ? "Coach paused. The transcript is still listening." : (captureHandle?.mixed ? "Microphone only. Rename a line if that was you." : "Listening.");
+  coachLiveText = "";
+  const streamed = await consumeCoachStream(`/api/coach/sessions/${sessionId}/utterances`, {
+    speaker: clip.speaker,
+    text,
+    audioBase64,
+  }, coachStreamHandlers());
+  state.coachStreaming = false;
+  coachLiveText = "";
+  if (state.coachSession?.id === sessionId && streamed.session) {
+    state.coachSession = streamed.session;
+    state.coachStatus = streamed.session.paused ? "Coach paused. The transcript is still listening." : (captureHandle?.mixed ? "Microphone only. Rename a line if that was you." : "Listening.");
     paintCoach();
   }
 }
@@ -1468,6 +1998,9 @@ function beginCoach(lead) {
     try {
       const session = await sessionPromise;
       state.coachSession = session;
+      state.coachLiveId = session.id;
+      state.coachPin = false;
+      parkedCoach = null;
       if (media) {
         const listen = await import("/listen.js");
         captureHandle = await listen.attachMedia(media, {
@@ -1492,6 +2025,7 @@ function beginCoach(lead) {
 function stopCallCapture() {
   captureHandle?.stop?.();
   captureHandle = null;
+  state.coachLiveId = null;
 }
 
 async function onDial(lead = state.queue.lead) {
@@ -1542,40 +2076,143 @@ function onNotesInput(value) {
   }, 400);
 }
 
-async function onDisposition(outcome) {
-  const lead = state.queue.lead;
-  if (!lead || state.busy || state.view !== "dial") return;
-  const campaign = campaignById(lead.campaignId);
-  if (campaign?.cadence?.autoAdvance === false) {
-    /* still log, but stay on this lead by reloading the same one after */
+function rememberProfileForm() {
+  const form = document.getElementById("profile-form");
+  if (!form) return;
+  const data = Object.fromEntries(new FormData(form));
+  state.profileDraft = { id: form.dataset.lead, ...data };
+  state.profileDirty = true;
+}
+
+async function confirmDirtyProfile() {
+  if (!state.profileDirty) return "discard";
+  return askConfirm("This profile has unsaved edits.", [
+    { id: "save", label: "Save" },
+    { id: "discard", label: "Discard" },
+    { id: "keep", label: "Keep editing" },
+  ]);
+}
+
+async function saveProfile(confirmFirst = true) {
+  const form = document.getElementById("profile-form");
+  if (!form) return false;
+  if (confirmFirst) {
+    const choice = await askConfirm("Save these changes?", [
+      { id: "save", label: "Save" },
+      { id: "keep", label: "Keep editing" },
+    ]);
+    if (choice !== "save") return false;
   }
+  const data = Object.fromEntries(new FormData(form));
+  const leadId = form.dataset.lead;
+  const current = state.queue?.lead?.id === leadId ? state.queue.lead : state.detail;
+  const payload = {
+    name: data.name,
+    title: data.title,
+    company: data.company,
+    phone: data.phone,
+    email: data.email,
+    timezone: data.timezone,
+    campaignId: data.campaignId,
+  };
+  if (!current || data.status !== current.status) payload.status = data.status;
+  const updated = await api(`/api/leads/${leadId}`, { method: "PATCH", body: JSON.stringify(payload) });
+  const full = await api(`/api/leads/${leadId}`);
+  state.profileDirty = false;
+  state.profileDraft = null;
+  if (state.queue?.lead?.id === leadId) state.queue.lead = full;
+  if (state.detail?.id === leadId) state.detail = full;
+  showToast("Profile saved");
+  if (updated) render();
+  return true;
+}
+
+async function switchRecordTab(scope, tab) {
+  if (recordTab(scope) === tab) return;
+  if (recordTab(scope) === "profile" && state.profileDirty) {
+    const choice = await confirmDirtyProfile();
+    if (choice === "keep") return;
+    if (choice === "save") {
+      const saved = await saveProfile(false);
+      if (!saved) return;
+    }
+    state.profileDirty = false;
+    state.profileDraft = null;
+  }
+  if (scope === "leads") state.leadsTab = tab;
+  else state.dialTab = tab;
+  const lead = scope === "leads" ? state.detail : state.queue?.lead;
+  if (tab === "notes" && lead) await loadRecordNotes(lead.id);
+  if (tab === "chat" && lead) {
+    try { await ensureCoachSession(lead); } catch (error) { showToast(error.message); }
+  }
+  render();
+}
+
+async function closeLeadModal() {
+  if (state.profileDirty) {
+    const choice = await confirmDirtyProfile();
+    if (choice === "keep") return;
+    if (choice === "save") {
+      const saved = await saveProfile(false);
+      if (!saved) return;
+    }
+  }
+  state.profileDirty = false;
+  state.profileDraft = null;
+  state.leadModal = false;
+  state.noteEdit = null;
+  restoreParkedCoach();
+  render();
+}
+
+async function onDisposition(outcome, leadId) {
+  const queueLead = state.queue?.lead;
+  const targetId = leadId || queueLead?.id;
+  if (!targetId || state.busy) return;
+  if (!leadId && state.view !== "dial") return;
+  const onDialer = state.view === "dial" && queueLead?.id === targetId;
+  const lead = onDialer ? queueLead : (state.detail?.id === targetId ? state.detail : null);
+  const campaign = campaignById((lead || queueLead)?.campaignId);
   state.busy = true;
   clearTimeout(notesTimer);
-  const timed = consumeTimer(lead.id);
-  const sessionId = state.coachSession?.leadId === lead.id ? state.coachSession.id : null;
-  stopCallCapture();
+  const timed = consumeTimer(targetId);
+  const sessionId = onDialer ? (state.coachLiveId || (state.coachSession?.leadId === targetId ? state.coachSession.id : null)) : null;
+  const viewingLive = onDialer && (!state.coachLiveId || state.coachSession?.id === state.coachLiveId);
+  if (onDialer) stopCallCapture();
   const settle = clipChain;
   try {
-    const updated = await api(`/api/leads/${lead.id}/disposition`, {
+    await api(`/api/leads/${targetId}/disposition`, {
       method: "POST",
-      body: JSON.stringify({ outcome, notes: state.draftNotes, durationSeconds: timed.durationSeconds, startedAt: timed.startedAt }),
+      body: JSON.stringify({ outcome, durationSeconds: timed.durationSeconds, startedAt: timed.startedAt }),
     });
-    state.session.talk += timed.durationSeconds;
-    if (outcome === "positive" || outcome === "not_interested") state.session.connected += 1;
-    showToast(updated.followupDraft ? `${STATUS_LABELS[outcome]} · follow-up draft filed` : STATUS_LABELS[outcome]);
+    if (onDialer) {
+      state.session.talk += timed.durationSeconds;
+      if (outcome === "positive" || outcome === "not_interested") state.session.connected += 1;
+    }
+    showToast(STATUS_LABELS[outcome] || outcome);
     if (sessionId) {
       void settle.finally(() => api(`/api/coach/sessions/${sessionId}/finish`, { method: "POST" }).catch(() => {}));
       try {
-        state.coachSession = await api(`/api/coach/sessions/${sessionId}`);
-        state.coachStatus = "Writing the review…";
+        const latest = await api(`/api/coach/sessions/${sessionId}`);
+        if (viewingLive) {
+          state.coachSession = latest;
+          state.coachStatus = "Writing the review…";
+        }
       } catch {
         /* the review still lands on the call */
       }
     }
     await refreshCore();
-    if (campaign?.cadence?.autoAdvance === false) {
-      state.queue.lead = await api(`/api/leads/${lead.id}`);
+    if (state.view === "leads" && state.leadModal) {
+      state.detail = await api(`/api/leads/${targetId}`);
+      await loadRecordNotes(targetId);
+      await loadLeads();
+      render();
+    } else if (campaign?.cadence?.autoAdvance === false) {
+      state.queue.lead = await api(`/api/leads/${targetId}`);
       state.draftNotes = state.queue.lead.notes || "";
+      await loadRecordNotes(targetId);
       render();
     } else {
       await showView("dial");
@@ -1588,7 +2225,25 @@ async function onDisposition(outcome) {
 }
 
 async function selectLead(id) {
+  if (state.leadModal && state.detail?.id !== id && state.profileDirty) {
+    const choice = await confirmDirtyProfile();
+    if (choice === "keep") return;
+    if (choice === "save") {
+      const saved = await saveProfile(false);
+      if (!saved) return;
+    }
+    state.profileDirty = false;
+    state.profileDraft = null;
+  }
   state.detail = await api(`/api/leads/${id}`);
+  state.leadModal = true;
+  state.noteEdit = null;
+  state.noteTags = [];
+  state.noteDraft = "";
+  await loadRecordNotes(id);
+  if (state.leadsTab === "chat") {
+    try { await ensureCoachSession(state.detail); } catch (error) { showToast(error.message); }
+  }
   render();
 }
 
@@ -1649,14 +2304,52 @@ document.body.addEventListener("click", async (event) => {
     }
     return;
   }
-  if (action === "nav") await showView(trigger.dataset.view);
+  if (action === "nav") {
+    if (state.profileDirty) {
+      const choice = await confirmDirtyProfile();
+      if (choice === "keep") return;
+      if (choice === "save") {
+        const saved = await saveProfile(false);
+        if (!saved) return;
+      }
+      state.profileDirty = false;
+      state.profileDraft = null;
+    }
+    state.leadModal = false;
+    restoreParkedCoach();
+    await showView(trigger.dataset.view);
+  }
   else if (action === "open-lead") leadForm(null);
   else if (action === "edit-lead") leadForm(state.detail?.id === trigger.dataset.id ? state.detail : state.leads.find((lead) => lead.id === trigger.dataset.id));
   else if (action === "open-campaign") campaignForm();
   else if (action === "open-script") scriptForm();
   else if (action === "import") importForm();
   else if (action === "close-modal") closeModal();
-  else if (action === "disposition") onDisposition(trigger.dataset.outcome);
+  else if (action === "disposition") onDisposition(trigger.dataset.outcome, trigger.dataset.lead);
+  else if (action === "record-tab") await switchRecordTab(trigger.dataset.scope, trigger.dataset.tab);
+  else if (action === "close-lead") await closeLeadModal();
+  else if (action === "note-tag") {
+    const tag = trigger.dataset.tag;
+    state.noteTags = state.noteTags.includes(tag) ? state.noteTags.filter((item) => item !== tag) : [...state.noteTags, tag];
+    trigger.className = `rounded-full border px-2 py-1 text-[11px] ${state.noteTags.includes(tag) ? "border-mint text-mint" : "border-line text-slate-300"}`;
+  } else if (action === "note-edit") {
+    state.noteEdit = trigger.dataset.id;
+    render();
+  } else if (action === "note-edit-cancel") {
+    state.noteEdit = null;
+    render();
+  } else if (action === "note-delete") {
+    const choice = await askConfirm("Delete this note?", [
+      { id: "save", label: "Delete" },
+      { id: "keep", label: "Keep" },
+    ]);
+    if (choice !== "save") return;
+    const removed = await api(`/api/lead-notes/${trigger.dataset.id}`, { method: "DELETE" });
+    const leadId = removed?.leadId || recordLead()?.id;
+    if (leadId) await loadRecordNotes(leadId);
+    state.noteEdit = null;
+    render();
+  }
   else if (action === "objection") {
     state.objectionLabel = state.objectionLabel === trigger.dataset.label ? null : trigger.dataset.label;
     render();
@@ -1962,12 +2655,112 @@ document.body.addEventListener("click", async (event) => {
     stopCallCapture();
     state.coachStatus = "Listening stopped. The transcript is still here.";
     paintCoach();
+  } else if (action === "coach-reset") {
+    if (!state.coachSession || state.coachBusy) return;
+    const choice = await askConfirm("Clear this chat? The thread and its branches are removed.", [
+      { id: "save", label: "Reset chat" },
+      { id: "keep", label: "Keep chat" },
+    ]);
+    if (choice !== "save") return;
+    const familyIds = new Set((state.coachSession.branches || []).map((branch) => branch.id).concat(state.coachSession.id));
+    if (captureHandle && familyIds.has(state.coachLiveId)) stopCallCapture();
+    try {
+      const fresh = await api(`/api/coach/sessions/${state.coachSession.id}/reset`, { method: "POST" });
+      state.coachSession = fresh;
+      state.coachPin = false;
+      state.coachLiveId = null;
+      state.coachEdit = null;
+      state.wrongFor = null;
+      state.coachInfo = null;
+      state.coachStreaming = false;
+      state.coachStatus = "Chat cleared.";
+      if (parkedCoach && familyIds.has(parkedCoach.session?.id)) parkedCoach = null;
+      showToast("Chat cleared");
+      render();
+    } catch (error) {
+      showToast(error.message);
+    }
   } else if (action === "coach-hide") {
     state.coachPin = false;
     state.coachSession = null;
     state.wrongFor = null;
     state.coachStatus = "";
     render();
+  } else if (action === "coach-copy") {
+    const message = state.coachSession?.messages?.find((item) => item.id === trigger.dataset.id);
+    if (!message) return;
+    try {
+      await navigator.clipboard.writeText(message.body);
+      showToast("Copied");
+    } catch (error) {
+      showToast(error.message);
+    }
+  } else if (action === "coach-edit") {
+    state.coachEdit = state.coachEdit === trigger.dataset.id ? null : trigger.dataset.id;
+    state.wrongFor = null;
+    paintCoach();
+  } else if (action === "coach-edit-cancel") {
+    state.coachEdit = null;
+    paintCoach();
+  } else if (action === "coach-info") {
+    state.coachInfo = state.coachInfo === trigger.dataset.id ? null : trigger.dataset.id;
+    paintCoach();
+  } else if (action === "coach-up") {
+    try {
+      state.coachSession = await api(`/api/coach/messages/${trigger.dataset.id}/feedback`, {
+        method: "POST",
+        body: JSON.stringify({ vote: "up" }),
+      });
+      const saved = state.coachSession.messages.find((item) => item.id === trigger.dataset.id);
+      showToast(saved?.rating === "up" ? "Saved to coach memory" : "Mark cleared");
+      paintCoach();
+    } catch (error) {
+      showToast(error.message);
+    }
+  } else if (action === "coach-down") {
+    state.wrongFor = state.wrongFor === trigger.dataset.id ? null : trigger.dataset.id;
+    paintCoach();
+  } else if (action === "coach-continue") {
+    try {
+      await streamCoachMessage(`/api/coach/messages/${trigger.dataset.id}/continue`, {});
+    } catch (error) {
+      showToast(error.message);
+    }
+  } else if (action === "coach-regen") {
+    try {
+      await streamCoachMessage(`/api/coach/messages/${trigger.dataset.id}/regenerate`, {});
+    } catch (error) {
+      showToast(error.message);
+    }
+  } else if (action === "coach-branch") {
+    try {
+      state.coachSession = await api(`/api/coach/sessions/${state.coachSession.id}/branch`, {
+        method: "POST",
+        body: JSON.stringify({ messageId: trigger.dataset.id }),
+      });
+      state.coachPin = true;
+      state.coachStatus = "Side thread. The live call stays on the original.";
+      paintCoach();
+    } catch (error) {
+      showToast(error.message);
+    }
+  } else if (action === "coach-sibling") {
+    const message = state.coachSession?.messages?.find((item) => item.id === trigger.dataset.id);
+    if (!message?.siblingIds) return;
+    const next = message.siblingIds[message.siblingIndex - 1 + Number(trigger.dataset.dir)];
+    if (!next) return;
+    try {
+      state.coachSession = await api(`/api/coach/messages/${next}/select`, { method: "POST" });
+      paintCoach();
+    } catch (error) {
+      showToast(error.message);
+    }
+  } else if (action === "coach-strip" || action === "coach-run") {
+    try {
+      await runCoachAction(coachActionById(trigger.dataset.actionId), trigger.dataset.id);
+    } catch (error) {
+      showToast(error.message);
+    }
   } else if (action === "coach-wrong") {
     state.wrongFor = state.wrongFor === trigger.dataset.id ? null : trigger.dataset.id;
     paintCoach();
@@ -2016,6 +2809,18 @@ document.body.addEventListener("click", async (event) => {
     state.playbookId = state.playbooks[0]?.id || null;
     showToast("Playbook deleted");
     render();
+  } else if (action === "delete-coach-action") {
+    await api(`/api/coach/actions/${trigger.dataset.id}`, { method: "DELETE" });
+    state.coachActions = await api("/api/coach/actions");
+    showToast("Action deleted");
+    render();
+  } else if (action === "toggle-coach-action") {
+    await api(`/api/coach/actions/${trigger.dataset.id}`, {
+      method: "PATCH",
+      body: JSON.stringify({ enabled: trigger.dataset.enabled === "1" }),
+    });
+    state.coachActions = await api("/api/coach/actions");
+    render();
   } else if (action === "save-mailbox") {
     const form = document.getElementById("mail-settings");
     const payload = Object.fromEntries(new FormData(form));
@@ -2038,6 +2843,7 @@ document.body.addEventListener("click", async (event) => {
 });
 
 document.body.addEventListener("change", async (event) => {
+  if (event.target.closest("#profile-form")) rememberProfileForm();
   if (event.target.dataset.action === "check-lead") {
     const id = event.target.dataset.id;
     if (event.target.checked) state.selected.add(id);
@@ -2092,7 +2898,8 @@ document.body.addEventListener("change", async (event) => {
 });
 
 document.body.addEventListener("input", (event) => {
-  if (event.target.id === "notes") onNotesInput(event.target.value);
+  if (event.target.closest("#profile-form")) rememberProfileForm();
+  if (event.target.closest("#note-form textarea")) state.noteDraft = event.target.value;
   if (event.target.id === "inbox-search") {
     state.inboxSearch = event.target.value;
     clearTimeout(searchTimer);
@@ -2124,34 +2931,114 @@ document.body.addEventListener("input", (event) => {
 });
 
 document.body.addEventListener("submit", async (event) => {
+  if (event.target.id === "profile-form") {
+    event.preventDefault();
+    try {
+      await saveProfile(true);
+    } catch (error) {
+      showToast(error.message);
+    }
+    return;
+  }
+  if (event.target.id === "note-form") {
+    event.preventDefault();
+    const form = event.target;
+    const body = new FormData(form).get("body");
+    const text = String(body || "").trim();
+    if (!text) return;
+    try {
+      await api(`/api/leads/${form.dataset.lead}/notes`, {
+        method: "POST",
+        body: JSON.stringify({ body: text, tags: state.noteTags }),
+      });
+      state.noteDraft = "";
+      state.noteTags = [];
+      await loadRecordNotes(form.dataset.lead);
+      render();
+    } catch (error) {
+      showToast(error.message);
+    }
+    return;
+  }
+  if (event.target.dataset.noteEdit) {
+    event.preventDefault();
+    const text = String(new FormData(event.target).get("body") || "").trim();
+    if (!text) return;
+    try {
+      const saved = await api(`/api/lead-notes/${event.target.dataset.noteEdit}`, {
+        method: "PATCH",
+        body: JSON.stringify({ body: text }),
+      });
+      state.noteEdit = null;
+      await loadRecordNotes(saved.leadId);
+      render();
+    } catch (error) {
+      showToast(error.message);
+    }
+    return;
+  }
   if (event.target.id === "coach-form") {
     event.preventDefault();
     const input = document.getElementById("coach-input");
     const text = input?.value.trim();
-    if (!text || !state.coachSession) return;
+    const lead = recordLead();
+    if (!text || state.coachBusy || (!lead && !state.coachSession)) return;
     input.value = "";
+    state.coachBusy = true;
+    showOwnCoachNote(text);
+    coachLiveText = "";
+    state.coachStreaming = true;
+    state.coachStatus = "Writing…";
+    const status = document.getElementById("coach-status");
+    if (status) status.textContent = "Writing…";
+    showCoachDraft();
+    let posted = false;
     try {
-      const updated = await api(`/api/coach/sessions/${state.coachSession.id}/notes`, {
-        method: "POST",
-        body: JSON.stringify({ text }),
-      });
+      const session = await ensureCoachSession(lead);
+      posted = true;
+      const streamed = await consumeCoachStream(`/api/coach/sessions/${session.id}/notes`, { text }, coachStreamHandlers());
+      const updated = streamed.session;
       state.coachSession = updated;
-      if (updated.personaUpdated) {
+      if (streamed.personaUpdated) {
         state.settings = await api("/api/settings");
         showToast("Coach instructions updated");
       }
-      if (updated.notepadUpdated) {
-        const lead = await api(`/api/leads/${updated.leadId}`);
-        if (state.queue?.lead?.id === lead.id) {
-          state.queue.lead.notes = lead.notes;
-          state.draftNotes = lead.notes || "";
-          const notes = document.getElementById("notes");
-          if (notes) notes.value = state.draftNotes;
-        }
-        if (state.detail?.id === lead.id) state.detail = lead;
-        showToast("Notepad updated");
+      if (streamed.notepadUpdated && updated?.leadId) {
+        await loadRecordNotes(updated.leadId);
+        const savedLead = await api(`/api/leads/${updated.leadId}`);
+        if (state.queue?.lead?.id === savedLead.id) state.queue.lead = savedLead;
+        if (state.detail?.id === savedLead.id) state.detail = savedLead;
+        showToast("Note added");
+        if (recordTab(state.view === "leads" ? "leads" : "dial") === "notes") render();
       }
+      state.coachStatus = coachReadyLine(state.queue?.lead, updated);
+    } catch (error) {
+      if (!posted && input) input.value = text;
+      showToast(error.message);
+      if (posted && state.coachSession?.id) {
+        try { state.coachSession = await api(`/api/coach/sessions/${state.coachSession.id}`); } catch { /* keep the draft */ }
+      }
+    } finally {
+      state.coachBusy = false;
+      state.coachStreaming = false;
+      coachLiveText = "";
       paintCoach();
+    }
+    return;
+  }
+  if (event.target.dataset.editForm) {
+    event.preventDefault();
+    const id = event.target.dataset.editForm;
+    const body = String(new FormData(event.target).get("body") || "").trim();
+    const message = state.coachSession?.messages?.find((item) => item.id === id);
+    if (!body || !message) return;
+    try {
+      if (message.kind === "note") await streamCoachMessage(`/api/coach/messages/${id}/edit`, { body });
+      else {
+        state.coachEdit = null;
+        state.coachSession = await api(`/api/coach/messages/${id}/edit`, { method: "POST", body: JSON.stringify({ body }) });
+        paintCoach();
+      }
     } catch (error) {
       showToast(error.message);
     }
@@ -2162,9 +3049,9 @@ document.body.addEventListener("submit", async (event) => {
     const reason = String(new FormData(event.target).get("reason") || "").trim();
     if (!reason) return;
     try {
-      state.coachSession = await api(`/api/coach/messages/${event.target.dataset.wrongForm}/wrong`, {
+      state.coachSession = await api(`/api/coach/messages/${event.target.dataset.wrongForm}/feedback`, {
         method: "POST",
-        body: JSON.stringify({ reason }),
+        body: JSON.stringify({ vote: "down", reason }),
       });
       state.wrongFor = null;
       paintCoach();
@@ -2181,6 +3068,37 @@ document.body.addEventListener("submit", async (event) => {
         body: JSON.stringify(Object.fromEntries(new FormData(event.target))),
       });
       showToast("Persona saved");
+    } catch (error) {
+      showToast(error.message);
+    }
+    return;
+  }
+  if (event.target.id === "coach-action-form") {
+    event.preventDefault();
+    const form = new FormData(event.target);
+    const effect = String(form.get("effect") || "steer");
+    const text = String(form.get("text") || "").trim();
+    const payload = effect === "disposition"
+      ? { outcome: String(form.get("outcome") || "") }
+      : effect === "prompt"
+        ? { prompt: text }
+        : { text };
+    try {
+      await api("/api/coach/actions", {
+        method: "POST",
+        body: JSON.stringify({
+          label: form.get("label"),
+          icon: form.get("icon"),
+          placement: form.get("placement"),
+          effect,
+          shortcut: form.get("shortcut"),
+          kinds: form.getAll("kinds"),
+          payload,
+        }),
+      });
+      state.coachActions = await api("/api/coach/actions");
+      showToast("Action added");
+      render();
     } catch (error) {
       showToast(error.message);
     }
@@ -2204,7 +3122,18 @@ document.body.addEventListener("submit", async (event) => {
 });
 
 document.body.addEventListener("change", async (event) => {
-  if (!event.target.dataset.speakerFor) return;
+  if (!event.target.dataset.speakerFor && event.target.id !== "coach-branch") return;
+  if (event.target.id === "coach-branch") {
+    try {
+      state.coachSession = await api(`/api/coach/sessions/${event.target.value}`);
+      state.coachPin = state.coachSession.rootId !== state.coachSession.id;
+      state.coachStatus = state.coachPin ? "Side thread. The live call stays on the original." : coachReadyLine(state.queue?.lead, state.coachSession);
+      paintCoach();
+    } catch (error) {
+      showToast(error.message);
+    }
+    return;
+  }
   try {
     state.coachSession = await api(`/api/coach/messages/${event.target.dataset.speakerFor}`, {
       method: "PATCH",
@@ -2228,8 +3157,13 @@ document.addEventListener("keydown", (event) => {
     event.preventDefault();
     const link = document.getElementById("dial-link");
     if (link) link.click();
-  } else if (event.key >= "1" && event.key <= "5") {
-    onDisposition(OUTCOMES[Number(event.key) - 1].id);
+  }
+  const shortcut = event.code === "NumpadAdd" ? "NumpadAdd" : event.code === "NumpadSubtract" ? "NumpadSubtract" : event.code === "NumpadMultiply" ? "NumpadMultiply" : (/^[0-9]$/.test(event.key) ? event.key : "");
+  if (shortcut) {
+    const action = (state.coachActions || []).find((item) => item.enabled && item.shortcut === shortcut);
+    if (action?.effect === "disposition") onDisposition(action.payload.outcome);
+    else if (action?.effect === "steer") steerCoach(action).catch((error) => showToast(error.message));
+    else if (/^[1-5]$/.test(shortcut)) onDisposition(OUTCOMES[Number(shortcut) - 1].id);
   } else if (event.key.toLowerCase() === "n") {
     document.querySelector("[data-action=skip]")?.click();
   }
